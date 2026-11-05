@@ -7,9 +7,10 @@ using **Linux perf** as its only profiler.
 
 For a given target, SAGE:
 
-1. checks out the official upstream repository at a pinned commit,
-2. builds it with the target's configured commands,
-3. hands the binary to the agent. The agent runs `perf stat`, `perf record` and
+1. runs preflight checks for perf, compilers, the CPU and perf event support (`scripts/preflight.sh`),
+2. checks out the official upstream repository at a pinned commit and builds it with optimization,
+   `-g` and `-fno-omit-frame-pointer` (`scripts/build_target.sh`),
+3. hands the binary and the preflight results to the agent. The agent runs `perf stat`, `perf record` and
    `perf annotate`, reads the hot source code, and writes a Markdown report.
 
 The application's source code is never modified.
@@ -45,6 +46,11 @@ The application's source code is never modified.
   Hardware counters are often missing in VMs and containers. In that case the agent uses
   software events (`task-clock`, `cpu-clock`) and says so in the report.
 
+- On Ubuntu, `/usr/bin/perf` is a wrapper that refuses to run when no `linux-tools` package
+  matches the running kernel, which is common in VMs and containers. The preflight reports this
+  and names a real perf binary under `/usr/lib/linux-tools/*/perf`. Put that binary first on
+  `PATH`, for example with a symlink in `~/.local/bin`.
+
 ### 2. Install
 
 ```bash
@@ -67,7 +73,60 @@ The Agent SDK needs Claude credentials. The simplest option is an API key:
 export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-### 4. Run
+### 4. Check the machine (optional)
+
+`analyze` runs this itself, but you can run it alone to see what the machine supports:
+
+```bash
+scripts/preflight.sh
+```
+
+It writes `.work/preflight.json` and prints a summary. The checks:
+
+- `perf` is installed and runs
+- C and C++ compilers (gcc/g++ or clang/clang++), with their versions
+- CPU vendor, model and count, architecture and kernel
+- `perf_event_paranoid`
+- whether `cycles` and `instructions` can be counted, plus a software event (`task-clock`)
+  and topdown metrics (`perf stat -M TopdownL1`)
+
+It exits 1 if perf or a compiler is missing, or if no events can be measured. It **warns**,
+but still exits 0, when only software events are available, when topdown metrics are
+unsupported, or when `perf_event_paranoid` limits an unprivileged user to user-space samples.
+
+### 5. Build a target (optional)
+
+`analyze` also runs this itself:
+
+```bash
+scripts/build_target.sh lulesh
+```
+
+```bash
+scripts/build_target.sh comd --clean
+```
+
+The script validates the config, clones the upstream (or reuses `.work/<target>/src`), checks
+out the pinned commit, and runs the build commands. `--clean` deletes `.work/<target>/` first.
+It writes:
+
+- `.work/<target>/build.log`: the full output of every build command, after a header with the
+  commit, compiler version and flags.
+- `.work/<target>/build-info.json`: the commit, repo URL, compiler and compiler version, flags,
+  build commands, binary path, cmake and make versions, and the time of the build.
+  It is written only when the build succeeds.
+
+A failed build exits 1, prints the last lines of the log, and gives the log's path. A bad
+config exits 2.
+
+Upstream source files are never edited. The script refuses to build if a tracked file in the
+checkout differs from the pinned commit, and fails if the build itself changes one. Both
+targets currently build unmodified, using only command-line variables. CoMD's
+`Makefile.vanilla` is copied to a new, untracked `Makefile`, so nothing upstream changes. If a
+future build needs a source change, it should be stored as a patch file in this repository and
+applied explicitly. No patch is needed today, so there is no patch mechanism yet.
+
+### 6. Run
 
 Run from the repository root, since `.work/` and `runs/` are created in the current directory:
 
@@ -86,8 +145,10 @@ agent's turn limit (default 80). `--goal` adds a focus for the analysis.
 
 ```
 configs/lulesh.yaml, configs/comd.yaml   target configs
+.work/preflight.json                     results of the latest preflight checks
 .work/<target>/src/                      upstream checkout at the pinned commit (read-only to the agent)
 .work/<target>/build.log                 output of the build commands
+.work/<target>/build-info.json           commit, compiler version, flags and tools of the last good build
 .work/<target>/...                       build outputs (e.g. .work/lulesh/build/)
 runs/<target>-<timestamp>/               agent working directory: perf.data, logs, report.md
 ```
@@ -106,10 +167,12 @@ API. All problems are reported together.
 | `target` | yes | `lulesh` or `comd`; must match `--target` |
 | `repo_url` | yes | `https://` URL of the upstream repository |
 | `commit` | yes | full 40-character commit SHA to check out |
-| `build` | yes | list of shell commands, run in order from `.work/<target>/` |
+| `compiler` | yes | compiler command, available to the build commands as `$SAGE_COMPILER` |
+| `flags` | yes | compile flags, available as `$SAGE_FLAGS`; must include an `-O1`/`-O2`/`-O3`/`-Os`/`-Ofast` level, `-g` and `-fno-omit-frame-pointer` |
+| `build` | yes | list of shell commands, run in order from `.work/<target>/`; they must use both `$SAGE_COMPILER` and `$SAGE_FLAGS` |
 | `binary` | yes | path to the built binary, relative to `.work/<target>/` |
 | `run` | yes | default run command; `{binary}` expands to the binary's absolute path |
-| `env` | no | environment variables for the build, the agent and its runs |
+| `env` | no | environment variables for the build, the agent and its runs (names may not start with `SAGE_`) |
 
 Pinned upstreams (both URLs checked with `git ls-remote` when they were added):
 
@@ -120,8 +183,9 @@ Pinned upstreams (both URLs checked with `git ls-remote` when they were added):
 
 CoMD's original home, `github.com/exmatex/CoMD`, now resolves to `ECP-copa/CoMD`.
 
-Both builds produce optimized binaries with `-g -fno-omit-frame-pointer`, so perf can
-resolve symbols and call graphs. The default run sizes are chosen to take about 10–15 seconds
+Both targets use `-O3 -g -fno-omit-frame-pointer`, so perf can resolve symbols and call graphs.
+The LULESH config sets no `CMAKE_BUILD_TYPE`, so these are the exact compile flags. The build
+log shows the full compile lines. The default run sizes are chosen to take about 10–15 seconds
 on a 4-core machine. The agent adjusts the size if a run is far outside 5–30 seconds.
 
 ## How the agent is constrained
@@ -141,23 +205,25 @@ on a 4-core machine. The agent adjusts the size if a run is far outside 5–30 s
   and checks them again after the agent finishes. This catches writes the command check cannot
   see, such as a write from inside `python -c`.
 
-Code: `sage/config.py` (config loading and validation), `sage/agent.py` (checkout, build,
-the agent and the CLI), `sage/guard.py` (the safety rails).
+Code: `scripts/preflight.sh` and `scripts/build_target.sh` (machine checks, checkout and build),
+`sage/config.py` (config loading and validation, also used by the build script),
+`sage/agent.py` (the agent and the CLI), `sage/guard.py` (the safety rails).
 
 ## Exit codes
 
 | Code | Meaning |
 | --- | --- |
 | 0 | report written |
-| 1 | setup failed (perf missing, checkout or build error) or the agent run failed |
+| 1 | preflight failed (no usable perf, compiler or events), checkout or build failed, or the agent run failed |
 | 2 | invalid command line, target or config |
 | 3 | application source was modified |
 
 ## Tests
 
-The tests need no Anthropic API access, MPI, perf binary, hardware counters or network.
-The SDK's `query()` is replaced with a fake, and a local git repository stands in for the
-upstream.
+The tests need no Anthropic API access, MPI, perf binary, hardware counters, compiler or
+network. The SDK's `query()` is replaced with a fake. perf and the compiler are replaced with
+small fake executables, which simulate machines with full hardware counters, with software
+events only, or with a broken perf. A local git repository stands in for the upstream.
 
 ```bash
 pytest

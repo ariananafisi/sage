@@ -1,15 +1,18 @@
 # LULESH 2.0, Livermore Unstructured Lagrangian Explicit Shock Hydrodynamics.
-# Build commands and the binary path are relative to .work/lulesh/; the checkout is .work/lulesh/src.
+# Build commands run from .work/lulesh/ with $SAGE_COMPILER and $SAGE_FLAGS set from this file;
+# the checkout is .work/lulesh/src. The binary path is relative to .work/lulesh/.
 target: lulesh
 repo_url: https://github.com/LLNL/LULESH.git
 commit: 3e01c40b3281aadb7f996525cdd4a3354f6d3801  # master, 2020-11-18
+compiler: g++
+flags: -O3 -g -fno-omit-frame-pointer
 build:
-  # Serial (no MPI) + OpenMP, optimized, with symbols and frame pointers for perf call graphs.
+  # Serial (no MPI) + OpenMP. No CMAKE_BUILD_TYPE, so $SAGE_FLAGS are the exact compile flags.
   # CMAKE_POLICY_VERSION_MINIMUM lets CMake >= 4 accept the project's cmake_minimum_required(3.0).
   - >-
-    cmake -S src -B build -DCMAKE_BUILD_TYPE=Release -DWITH_MPI=OFF -DWITH_OPENMP=ON
-    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_CXX_FLAGS="-g -fno-omit-frame-pointer"
-  - cmake --build build -j
+    cmake -S src -B build -DWITH_MPI=OFF -DWITH_OPENMP=ON -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+    -DCMAKE_CXX_COMPILER="$SAGE_COMPILER" -DCMAKE_CXX_FLAGS="$SAGE_FLAGS"
+  - cmake --build build -j --verbose
 binary: build/lulesh2.0
 # -s: elements per edge, -i: iterations. About 10 s on 4 cores.
 run: "{binary} -s 50 -i 300"

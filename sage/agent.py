@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
-import shutil
 import subprocess
 import sys
 import time
@@ -40,10 +40,9 @@ Rules (enforced; violating commands are denied):
 - MPI may be unavailable: use serial / single-rank runs.
 
 Method:
-1. Check the environment: `perf --version`, /proc/sys/kernel/perf_event_paranoid,
-   CPU model, core count, and whether hardware events work
-   (`perf stat -e cycles,instructions true`). If hardware counters are
-   unavailable, fall back to software events (task-clock, cpu-clock) and say so.
+1. Preflight checks have already run; their results are in the task. If hardware
+   counters are unavailable, use software events (task-clock, cpu-clock) and say
+   so; if topdown metrics are unsupported, do not attempt them.
 2. The binary is already built (optimized, -g, frame pointers). Start from the
    default run command; adjust the problem size only if a run is far outside
    roughly 5-30 seconds. Record the exact command and the app's own timing output.
@@ -81,69 +80,35 @@ APP_HINTS = {
 }
 
 
-class SetupError(Exception):
-    """Checkout or build failed; the agent was not started."""
+SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 
 
-def git(*args: str, cwd: Path | None = None) -> str:
-    r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
-    if r.returncode:
-        raise SetupError(f"git {' '.join(args)} failed: {r.stderr.strip()}")
-    return r.stdout.strip()
+def run_script(name: str, *args: str, cwd: Path) -> int:
+    """Run scripts/<name>; its progress and errors go straight to the user's terminal."""
+    env = {**os.environ, "PYTHON": sys.executable}
+    return subprocess.run(["bash", str(SCRIPTS / name), *args], cwd=cwd, env=env).returncode
 
 
-def checkout(cfg: TargetConfig, src: Path) -> None:
-    """Clone ``cfg.repo_url`` into ``src`` (or reuse it) and check out the pinned commit."""
-    if not (src / ".git").exists():
-        if src.exists() and any(src.iterdir()):
-            raise SetupError(f"{src} exists but is not a git checkout; remove it and retry")
-        print(f"cloning {cfg.repo_url} into {src}", file=sys.stderr)
-        git("clone", "--quiet", cfg.repo_url, str(src))
-    origin = git("remote", "get-url", "origin", cwd=src)
-    if origin != cfg.repo_url:
-        raise SetupError(f"{src} was cloned from {origin}, but the config says {cfg.repo_url}; remove it and retry")
-    if git("status", "--porcelain", "--untracked-files=no", cwd=src):
-        raise SetupError(f"{src} has local changes to tracked files; restore or remove it and retry")
-    if git("rev-parse", "HEAD", cwd=src) != cfg.commit:
-        if subprocess.run(["git", "cat-file", "-e", f"{cfg.commit}^{{commit}}"], cwd=src,
-                          capture_output=True).returncode:
-            git("fetch", "--quiet", "origin", cwd=src)
-        git("checkout", "--quiet", "--detach", cfg.commit, cwd=src)
-    if git("rev-parse", "HEAD", cwd=src) != cfg.commit:
-        raise SetupError(f"could not check out {cfg.commit} in {src}")
-
-
-def build(cfg: TargetConfig, work: Path) -> Path:
-    """Run the configured build commands from ``work``; return the binary's path."""
-    log = work / "build.log"
-    env = {**os.environ, **cfg.env}
-    with log.open("w") as f:
-        for cmd in cfg.build:
-            print(f"build: {cmd}", file=sys.stderr)
-            f.write(f"$ {cmd}\n")
-            f.flush()
-            r = subprocess.run(cmd, shell=True, executable="/bin/bash", cwd=work, env=env,
-                               stdout=f, stderr=subprocess.STDOUT)
-            if r.returncode:
-                raise SetupError(f"build command failed (exit {r.returncode}): {cmd}\n  see {log}")
-    binary = work / cfg.binary
-    if not (binary.is_file() and os.access(binary, os.X_OK)):
-        raise SetupError(f"build finished but {binary} is not an executable file; see {log}")
-    return binary
-
-
-def build_prompt(cfg: TargetConfig, work: Path, goal: str | None) -> str:
+def build_prompt(cfg: TargetConfig, work: Path, build_info: dict, preflight: dict, goal: str | None) -> str:
     env = " ".join(f"{k}={v}" for k, v in cfg.env.items()) or "(none)"
+    events = preflight.get("events", {})
     lines = [
         f"Profile {cfg.target.upper()} with perf and report its performance bottlenecks.",
         "",
-        f"Source checkout (read-only): {work / 'src'}  ({cfg.repo_url} @ {cfg.commit})",
+        f"Source checkout (read-only): {work / 'src'}  ({build_info['repo_url']} @ {build_info['commit']})",
         f"Work directory (builds): {work}",
-        f"Built binary: {work / cfg.binary}",
-        "Build commands used (run from the work directory):",
-        *[f"  $ {c}" for c in cfg.build],
+        f"Built binary: {build_info['binary']}",
+        f"Compiler: {build_info['compiler_version']}; flags: {build_info['flags']}",
+        "Build commands used (run from the work directory, build log in build.log):",
+        *[f"  $ {c}" for c in build_info["build_commands"]],
         f"Default run command: {cfg.run_command(work)}",
         f"Environment (already set for your commands): {env}",
+        "",
+        "Preflight results (from scripts/preflight.sh; no need to repeat these checks):",
+        f"  CPU: {preflight.get('host', {}).get('cpu_model')} ({preflight.get('host', {}).get('cpus')} CPUs), "
+        f"{preflight.get('perf', {}).get('version')}, perf_event_paranoid={preflight.get('perf_event_paranoid')}",
+        "  events: " + ", ".join(f"{k}={'yes' if v else 'no'}" for k, v in events.items()),
+        *[f"  warning: {w}" for w in preflight.get("warnings", [])],
     ]
     if goal:
         lines += ["", f"Additional focus: {goal}"]
@@ -167,21 +132,22 @@ def build_options(cfg: TargetConfig, work: Path, run_dir: Path, protected: set[s
     )
 
 
-async def run(cfg: TargetConfig, root: Path, model: str | None = None,
+async def run(cfg: TargetConfig, config_path: Path, root: Path, model: str | None = None,
               max_turns: int = 80, goal: str | None = None) -> int:
-    if shutil.which("perf") is None:
-        print("error: perf not found on PATH", file=sys.stderr)
-        return 1
     root = root.resolve()
-    work = root / ".work" / cfg.target
-    work.mkdir(parents=True, exist_ok=True)
-    try:
-        checkout(cfg, work / "src")
-        source = snapshot(work / "src")
-        build(cfg, work)
-    except SetupError as e:
-        print(f"error: {e}", file=sys.stderr)
+    work_root = root / ".work"
+    work = work_root / cfg.target
+    preflight_path = work_root / "preflight.json"
+    if run_script("preflight.sh", "--output", str(preflight_path), cwd=root):
+        print(f"error: preflight failed; see {preflight_path}", file=sys.stderr)
         return 1
+    if run_script("build_target.sh", cfg.target, "--config", str(Path(config_path).resolve()),
+                  "--work", str(work_root), cwd=root):
+        print("error: build failed (see the log path above)", file=sys.stderr)
+        return 1
+    preflight = json.loads(preflight_path.read_text())
+    build_info = json.loads((work / "build-info.json").read_text())
+    source = snapshot(work / "src")
 
     run_dir = root / "runs" / f"{cfg.target}-{time.strftime('%Y%m%d-%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -189,7 +155,7 @@ async def run(cfg: TargetConfig, root: Path, model: str | None = None,
 
     report, status = None, 0
     try:
-        async for message in query(prompt=build_prompt(cfg, work, goal), options=options):
+        async for message in query(prompt=build_prompt(cfg, work, build_info, preflight, goal), options=options):
             if isinstance(message, AssistantMessage):
                 for block in message.content:
                     if isinstance(block, TextBlock):
@@ -221,7 +187,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="bottleneck-agent", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
     analyze = commands.add_parser("analyze", help="build a target and profile it with perf",
-                                  description="Check out and build a target, then let the agent profile it with perf.")
+                                  description="Run preflight checks, check out and build a target, "
+                                              "then let the agent profile it with perf.")
     analyze.add_argument("--target", required=True, metavar="{" + ",".join(TARGETS) + "}",
                          help="proxy application to analyze")
     analyze.add_argument("--config", required=True, type=Path, metavar="PATH",
@@ -238,7 +205,7 @@ def main(argv: list[str] | None = None) -> int:
         cfg = load_config(args.config, args.target)
     except ConfigError as e:
         analyze.error(str(e))
-    return asyncio.run(run(cfg, Path.cwd(), args.model, args.max_turns, args.goal))
+    return asyncio.run(run(cfg, args.config, Path.cwd(), args.model, args.max_turns, args.goal))
 
 
 if __name__ == "__main__":
