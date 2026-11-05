@@ -107,3 +107,17 @@ def test_snapshot_detects_edits_and_deletions_only(tmp_path):
     (tmp_path / "a.cc").write_text("int a = 1;")
     (tmp_path / "b.h").unlink()
     assert [p.split("/")[-1] for p in changed(snap)] == ["a.cc", "b.h"]
+
+
+def test_snapshot_of_git_checkout_covers_tracked_files_only(tmp_path):
+    import subprocess
+    git = lambda *a: subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a],
+                                    cwd=tmp_path, check=True, capture_output=True)
+    git("init", "-q")
+    (tmp_path / "a.c").write_text("int a;")
+    (tmp_path / "README").write_text("docs")
+    git("add", ".")
+    git("commit", "-qm", "init")
+    (tmp_path / "CoMD_info.h").write_text("// generated")
+    snap = snapshot(tmp_path)
+    assert {p.split("/")[-1] for p in snap} == {"a.c", "README"}

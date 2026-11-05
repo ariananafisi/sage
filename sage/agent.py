@@ -1,10 +1,12 @@
-"""SAGE: a single Claude agent that finds performance bottlenecks with Linux perf."""
+"""bottleneck-agent: a single Claude agent that finds performance bottlenecks with Linux perf."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -20,6 +22,7 @@ from claude_agent_sdk import (
     query,
 )
 
+from .config import TARGETS, ConfigError, TargetConfig, load_config
 from .guard import changed, make_guard, snapshot
 
 TOOLS = ["Bash", "Read", "Glob", "Grep"]
@@ -30,28 +33,26 @@ performance bottlenecks of an HPC proxy application using Linux perf.
 
 Rules (enforced; violating commands are denied):
 - perf is the only profiler. Do not use gprof, valgrind, VTune, strace, -pg, etc.
-- Never modify application source code, Makefiles or CMake files. Configure the
-  build only through command-line variables (e.g. `make CC=gcc VAR=value`,
-  `cmake -DVAR=value`). Creating new files (build directories, a Makefile copied
-  from a shipped template, perf.data, logs) is fine.
-- Work inside the current directory. The application is in ./src.
-- MPI may be unavailable: build and run serial / single-rank variants.
+- Never modify the application's source checkout. If you need a different build,
+  configure it only through command-line variables (e.g. `make VAR=value`,
+  `cmake -DVAR=value`) into a new build directory under the work directory.
+- Write perf data, logs and notes in the current directory (the run directory).
+- MPI may be unavailable: use serial / single-rank runs.
 
 Method:
 1. Check the environment: `perf --version`, /proc/sys/kernel/perf_event_paranoid,
    CPU model, core count, and whether hardware events work
    (`perf stat -e cycles,instructions true`). If hardware counters are
    unavailable, fall back to software events (task-clock, cpu-clock) and say so.
-2. Read the build files and README, then build an optimized binary with symbols
-   and frame pointers (-O2 or -O3, -g, -fno-omit-frame-pointer).
-3. Choose a problem size that runs for roughly 5-30 seconds. Record the exact
-   command line and the application's own timing output.
-4. Baseline with `perf stat` (cycles, instructions, IPC, cache and branch
+2. The binary is already built (optimized, -g, frame pointers). Start from the
+   default run command; adjust the problem size only if a run is far outside
+   roughly 5-30 seconds. Record the exact command and the app's own timing output.
+3. Baseline with `perf stat` (cycles, instructions, IPC, cache and branch
    misses, as available).
-5. Sample with `perf record -g` (try `--call-graph dwarf` if frame-pointer
+4. Sample with `perf record -g` (try `--call-graph dwarf` if frame-pointer
    stacks look broken) and inspect `perf report --stdio --no-children` and
    `perf annotate --stdio` for the top functions.
-6. For each hotspot, read the relevant source and classify the bottleneck
+5. For each hotspot, read the relevant source and classify the bottleneck
    (compute-bound, memory-bandwidth/latency-bound, branch mispredictions,
    poor vectorization, load imbalance / serial sections, etc.), citing the perf
    evidence. Use targeted `perf stat -e` runs to confirm or reject hypotheses.
@@ -68,28 +69,97 @@ Finish with a Markdown report and nothing else, containing:
 
 APP_HINTS = {
     "lulesh": (
-        "The application is LULESH 2.0 (C++, hydrodynamics). It ships a CMakeLists.txt "
-        "(options WITH_MPI, WITH_OPENMP) and a Makefile. Prefer an out-of-tree CMake "
-        "build with -DWITH_MPI=OFF. Run `lulesh2.0 -h` for options such as -s (size) "
-        "and -i (iterations). If built with OpenMP, set OMP_NUM_THREADS explicitly."
+        "The application is LULESH 2.0 (C++, Lagrangian shock hydrodynamics, OpenMP). "
+        "Run the binary with -h for options: -s elements per edge, -i iterations. "
+        "Threads are controlled by OMP_NUM_THREADS."
     ),
     "comd": (
-        "The application is CoMD (C, classical molecular dynamics). Use src/src-mpi: "
-        "copy Makefile.vanilla to Makefile (a new file) and set variables on the make "
-        "command line, e.g. DO_MPI=OFF CC=gcc OPTFLAGS='-O3 -g -fno-omit-frame-pointer'. "
-        "Run the binary in src/bin with --help for options such as -x/-y/-z (lattice) "
-        "and -N (steps); -e selects the EAM potential (needs --potDir src/pots)."
+        "The application is CoMD (C, classical molecular dynamics). Run the binary with "
+        "--help for options: -x/-y/-z unit cells, -N steps. The default potential is "
+        "Lennard-Jones; -e selects EAM and needs --potDir <checkout>/pots."
     ),
 }
 
 
-def build_options(app: str, workdir: Path, protected: set[str], model: str | None, max_turns: int) -> ClaudeAgentOptions:
+class SetupError(Exception):
+    """Checkout or build failed; the agent was not started."""
+
+
+def git(*args: str, cwd: Path | None = None) -> str:
+    r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    if r.returncode:
+        raise SetupError(f"git {' '.join(args)} failed: {r.stderr.strip()}")
+    return r.stdout.strip()
+
+
+def checkout(cfg: TargetConfig, src: Path) -> None:
+    """Clone ``cfg.repo_url`` into ``src`` (or reuse it) and check out the pinned commit."""
+    if not (src / ".git").exists():
+        if src.exists() and any(src.iterdir()):
+            raise SetupError(f"{src} exists but is not a git checkout; remove it and retry")
+        print(f"cloning {cfg.repo_url} into {src}", file=sys.stderr)
+        git("clone", "--quiet", cfg.repo_url, str(src))
+    origin = git("remote", "get-url", "origin", cwd=src)
+    if origin != cfg.repo_url:
+        raise SetupError(f"{src} was cloned from {origin}, but the config says {cfg.repo_url}; remove it and retry")
+    if git("status", "--porcelain", "--untracked-files=no", cwd=src):
+        raise SetupError(f"{src} has local changes to tracked files; restore or remove it and retry")
+    if git("rev-parse", "HEAD", cwd=src) != cfg.commit:
+        if subprocess.run(["git", "cat-file", "-e", f"{cfg.commit}^{{commit}}"], cwd=src,
+                          capture_output=True).returncode:
+            git("fetch", "--quiet", "origin", cwd=src)
+        git("checkout", "--quiet", "--detach", cfg.commit, cwd=src)
+    if git("rev-parse", "HEAD", cwd=src) != cfg.commit:
+        raise SetupError(f"could not check out {cfg.commit} in {src}")
+
+
+def build(cfg: TargetConfig, work: Path) -> Path:
+    """Run the configured build commands from ``work``; return the binary's path."""
+    log = work / "build.log"
+    env = {**os.environ, **cfg.env}
+    with log.open("w") as f:
+        for cmd in cfg.build:
+            print(f"build: {cmd}", file=sys.stderr)
+            f.write(f"$ {cmd}\n")
+            f.flush()
+            r = subprocess.run(cmd, shell=True, executable="/bin/bash", cwd=work, env=env,
+                               stdout=f, stderr=subprocess.STDOUT)
+            if r.returncode:
+                raise SetupError(f"build command failed (exit {r.returncode}): {cmd}\n  see {log}")
+    binary = work / cfg.binary
+    if not (binary.is_file() and os.access(binary, os.X_OK)):
+        raise SetupError(f"build finished but {binary} is not an executable file; see {log}")
+    return binary
+
+
+def build_prompt(cfg: TargetConfig, work: Path, goal: str | None) -> str:
+    env = " ".join(f"{k}={v}" for k, v in cfg.env.items()) or "(none)"
+    lines = [
+        f"Profile {cfg.target.upper()} with perf and report its performance bottlenecks.",
+        "",
+        f"Source checkout (read-only): {work / 'src'}  ({cfg.repo_url} @ {cfg.commit})",
+        f"Work directory (builds): {work}",
+        f"Built binary: {work / cfg.binary}",
+        "Build commands used (run from the work directory):",
+        *[f"  $ {c}" for c in cfg.build],
+        f"Default run command: {cfg.run_command(work)}",
+        f"Environment (already set for your commands): {env}",
+    ]
+    if goal:
+        lines += ["", f"Additional focus: {goal}"]
+    return "\n".join(lines)
+
+
+def build_options(cfg: TargetConfig, work: Path, run_dir: Path, protected: set[str],
+                  model: str | None, max_turns: int) -> ClaudeAgentOptions:
     return ClaudeAgentOptions(
         tools=TOOLS,  # the only built-in tools the agent can see: no Write/Edit, no subagents
         allowed_tools=TOOLS,
         permission_mode="dontAsk",  # anything not pre-approved is denied, never prompted
-        system_prompt=SYSTEM_PROMPT + "\n" + APP_HINTS[app],
-        cwd=str(workdir),
+        system_prompt=SYSTEM_PROMPT + "\n" + APP_HINTS[cfg.target],
+        cwd=str(run_dir),
+        add_dirs=[str(work)],
+        env=dict(cfg.env),
         setting_sources=[],  # ignore user/project settings, hooks and CLAUDE.md files
         hooks={"PreToolUse": [HookMatcher(hooks=[make_guard(protected)])]},
         model=model,
@@ -97,34 +167,29 @@ def build_options(app: str, workdir: Path, protected: set[str], model: str | Non
     )
 
 
-async def run(app: str, app_dir: Path, workdir: Path, model: str | None = None,
+async def run(cfg: TargetConfig, root: Path, model: str | None = None,
               max_turns: int = 80, goal: str | None = None) -> int:
-    app_dir = app_dir.resolve()
-    workdir = workdir.resolve()
-    if not app_dir.is_dir():
-        print(f"error: {app_dir} is not a directory", file=sys.stderr)
-        return 1
-    if workdir == app_dir or app_dir in workdir.parents:
-        print("error: --workdir must be outside the application directory", file=sys.stderr)
-        return 1
     if shutil.which("perf") is None:
         print("error: perf not found on PATH", file=sys.stderr)
         return 1
+    root = root.resolve()
+    work = root / ".work" / cfg.target
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        checkout(cfg, work / "src")
+        source = snapshot(work / "src")
+        build(cfg, work)
+    except SetupError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
 
-    # The agent builds and profiles a pristine copy so the user's checkout stays clean.
-    src = workdir / "src"
-    workdir.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(app_dir, src, ignore=shutil.ignore_patterns(".git"), dirs_exist_ok=True)
-    original, copy = snapshot(app_dir), snapshot(src)
-
-    options = build_options(app, workdir, set(original) | set(copy), model, max_turns)
-    prompt = f"Profile {app.upper()} (source in ./src) with perf and report its performance bottlenecks."
-    if goal:
-        prompt += f"\nAdditional focus: {goal}"
+    run_dir = root / "runs" / f"{cfg.target}-{time.strftime('%Y%m%d-%H%M%S')}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    options = build_options(cfg, work, run_dir, set(source), model, max_turns)
 
     report, status = None, 0
     try:
-        async for message in query(prompt=prompt, options=options):
+        async for message in query(prompt=build_prompt(cfg, work, goal), options=options):
             if isinstance(message, AssistantMessage):
                 for block in message.content:
                     if isinstance(block, TextBlock):
@@ -141,28 +206,39 @@ async def run(app: str, app_dir: Path, workdir: Path, model: str | None = None,
         status = 1
 
     if report:
-        (workdir / "report.md").write_text(report)
+        (run_dir / "report.md").write_text(report)
         print(report)
+    print(f"run directory: {run_dir}", file=sys.stderr)
 
-    violations = changed(original) + changed(copy)
+    violations = changed(source)
     if violations:
         print("error: application source was modified:\n  " + "\n  ".join(violations), file=sys.stderr)
-        return 2
+        return 3
     return status
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="sage", description=__doc__)
-    parser.add_argument("app", choices=sorted(APP_HINTS), help="proxy application to profile")
-    parser.add_argument("app_dir", type=Path, help="path to the application's source checkout")
-    parser.add_argument("--workdir", type=Path, help="where builds, perf data and report.md go "
-                        "(default: ./sage-runs/<app>-<timestamp>)")
-    parser.add_argument("--model", help="Claude model to use (default: SDK default)")
-    parser.add_argument("--max-turns", type=int, default=80)
-    parser.add_argument("--goal", help="extra focus for the analysis, e.g. 'memory behaviour'")
+    parser = argparse.ArgumentParser(prog="bottleneck-agent", description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
+    analyze = commands.add_parser("analyze", help="build a target and profile it with perf",
+                                  description="Check out and build a target, then let the agent profile it with perf.")
+    analyze.add_argument("--target", required=True, metavar="{" + ",".join(TARGETS) + "}",
+                         help="proxy application to analyze")
+    analyze.add_argument("--config", required=True, type=Path, metavar="PATH",
+                         help="target config YAML, e.g. configs/lulesh.yaml")
+    analyze.add_argument("--model", help="Claude model to use (default: SDK default)")
+    analyze.add_argument("--max-turns", type=int, default=80)
+    analyze.add_argument("--goal", help="extra focus for the analysis, e.g. 'memory behaviour'")
     args = parser.parse_args(argv)
-    workdir = args.workdir or Path("sage-runs") / f"{args.app}-{time.strftime('%Y%m%d-%H%M%S')}"
-    return asyncio.run(run(args.app, args.app_dir, workdir, args.model, args.max_turns, args.goal))
+
+    # Validate everything up front, before cloning, building or calling the API.
+    if args.target not in TARGETS:
+        analyze.error(f"invalid target {args.target!r} (choose from {', '.join(TARGETS)})")
+    try:
+        cfg = load_config(args.config, args.target)
+    except ConfigError as e:
+        analyze.error(str(e))
+    return asyncio.run(run(cfg, Path.cwd(), args.model, args.max_turns, args.goal))
 
 
 if __name__ == "__main__":

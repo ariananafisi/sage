@@ -15,6 +15,7 @@ import hashlib
 import os
 import re
 import shlex
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -53,15 +54,22 @@ def is_source_file(path: Path) -> bool:
 
 
 def snapshot(root: Path) -> dict[str, str]:
-    """Map absolute path -> sha256 for every source file under ``root``."""
-    digests = {}
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d != ".git"]
-        for name in filenames:
-            path = Path(dirpath, name)
-            if is_source_file(path) and path.is_file():
-                digests[str(path.resolve())] = hashlib.sha256(path.read_bytes()).hexdigest()
-    return digests
+    """Map absolute path -> sha256 for the application source under ``root``.
+
+    In a git checkout that is every tracked file, so generated files (objects,
+    a copied Makefile, CoMD_info.h) are never mistaken for source. Otherwise it
+    is every file that looks like source.
+    """
+    tracked = subprocess.run(["git", "-C", str(root), "ls-files", "-z"], capture_output=True) \
+        if (root / ".git").exists() else None
+    if tracked and tracked.returncode == 0:
+        paths = [root / p for p in tracked.stdout.decode().split("\0") if p]
+    else:
+        paths = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d != ".git"]
+            paths += [Path(dirpath, n) for n in filenames if is_source_file(Path(dirpath, n))]
+    return {str(p.resolve()): hashlib.sha256(p.read_bytes()).hexdigest() for p in paths if p.is_file()}
 
 
 def changed(before: dict[str, str]) -> list[str]:

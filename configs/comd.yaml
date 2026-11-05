@@ -1,0 +1,14 @@
+# CoMD, classical molecular dynamics proxy app (ExMatEx / ECP Co-design Center for Particle Applications).
+# Build commands and the binary path are relative to .work/comd/; the checkout is .work/comd/src.
+target: comd
+repo_url: https://github.com/ECP-copa/CoMD.git
+commit: 3d48396b77ca8caa3124bc2391f9139c3ffb556c  # master, 2016-03-02
+build:
+  # The upstream build expects Makefile.vanilla copied to Makefile; variables are overridden on the
+  # command line (serial build, no MPI, symbols and frame pointers for perf call graphs).
+  - cp src/src-mpi/Makefile.vanilla src/src-mpi/Makefile
+  - make -C src/src-mpi -j DO_MPI=OFF CC=gcc OPTFLAGS="-O3 -g -fno-omit-frame-pointer"
+binary: src/bin/CoMD-serial
+# Lennard-Jones potential, 30^3 unit cells (108,000 atoms), 100 steps. About 15 s on one core.
+run: "{binary} -x 30 -y 30 -z 30 -N 100"
+env: {}
