@@ -19,3 +19,20 @@ run: "{binary} -s 50 -i 300"
 env:
   OMP_NUM_THREADS: 4
   OMP_PROC_BIND: "true"
+
+# MPI variant: scripts/build_target.sh lulesh --mpi, scripts/profile_target.sh lulesh <id> --ranks N.
+mpi:
+  compiler: mpicxx
+  build:
+    - >-
+      cmake -S src -B build-mpi -DWITH_MPI=ON -DWITH_OPENMP=ON -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+      -DCMAKE_CXX_COMPILER="$SAGE_COMPILER" -DCMAKE_CXX_FLAGS="$SAGE_FLAGS"
+    - cmake --build build-mpi -j --verbose
+  binary: build-mpi/lulesh2.0
+  # Open MPI syntax; --oversubscribe allows more ranks than cores. For MPICH use "mpiexec -n {ranks}".
+  launcher: mpirun --oversubscribe -np {ranks}
+  # LULESH needs a cube number of ranks (1, 8, 27, ...). -s is the problem size per rank.
+  ranks: 8
+  run: "{binary} -s 20 -i 200"
+  env:
+    OMP_NUM_THREADS: 1  # one thread per rank

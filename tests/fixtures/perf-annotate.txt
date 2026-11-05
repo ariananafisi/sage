@@ -1,0 +1,40 @@
+ Percent |	Source code & Disassembly of CoMD-serial for task-clock:ppp (381 samples, percent: local period)
+----------------------------------------------------------------------------------------------------------------
+         :
+         :
+         :
+         : 3    Disassembly of section .text:
+         :
+         : 5    0000000000008300 <ljForce>:
+         : 6    fprintf(file, "  Epsilon          : "FMT1" eV\n", ljPot->epsilon);
+         : 7    fprintf(file, "  Sigma            : "FMT1" Angstroms\n", ljPot->sigma);
+         : 8    }
+         :
+         : 10   int ljForce(SimFlat* s)
+         : 11   {
+    0.00 :   8300:   endbr64
+    0.00 :   8304:   push   %rbp
+    0.00 :   8305:   mov    %rsp,%rbp
+    0.00 :   8308:   push   %r15
+    0.00 :   830a:   push   %r14
+    0.00 :   830c:   mov    %rdi,%r14
+    0.00 :   830f:   push   %r13
+    0.00 :   8311:   push   %r12
+    0.00 :   8313:   push   %rbx
+    0.00 :   8314:   sub    $0xd8,%rsp
+         : 22   LjPotential* pot = (LjPotential *) s->pot;
+    0.00 :   831b:   mov    %fs:0x28,%rax
+    0.00 :   8324:   mov    %rax,-0x38(%rbp)
+    0.00 :   8328:   mov    0x40(%rdi),%rax
+         : 26   real_t sigma = pot->sigma;
+         : 27   real_t epsilon = pot->epsilon;
+         : 28   real_t rCut = pot->cutoff;
+    0.00 :   832c:   movsd  (%rax),%xmm5
+         : 30   real_t sigma = pot->sigma;
+    0.00 :   8330:   movsd  0x40(%rax),%xmm0
+         : 32   real_t epsilon = pot->epsilon;
+    0.00 :   8335:   movsd  0x48(%rax),%xmm10
+         : 34   real_t rCut2 = rCut*rCut;
+         :
+         : 36   // zero forces and energy
+         : 37   real_t ePot = 0.0;

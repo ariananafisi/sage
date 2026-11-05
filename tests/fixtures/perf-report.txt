@@ -1,0 +1,51 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 448  of event 'task-clock:ppp'
+# Event count (approx.): 112000000
+#
+# Overhead  Shared Object         Symbol                              
+# ........  ....................  ....................................
+#
+    85.04%  CoMD-serial           [.] ljForce
+     2.90%  CoMD-serial           [.] putAtomInBox
+     1.56%  libc.so.6             [.] msort_with_tmp.part.0
+     1.34%  [kernel.kallsyms]     [k] exc_page_fault
+     1.12%  CoMD-serial           [.] timestep
+     0.67%  [kernel.kallsyms]     [k] _raw_spin_unlock_irqrestore
+     0.67%  libc.so.6             [.] __memmove_evex_unaligned_erms
+     0.45%  CoMD-serial           [.] sortAtomsById
+     0.45%  ld-linux-x86-64.so.2  [.] intel_check_word.constprop.0
+     0.22%  CoMD-serial           [.] gasdev
+     0.22%  CoMD-serial           [.] getBoxFromTuple
+     0.22%  CoMD-serial           [.] initAtoms
+     0.22%  CoMD-serial           [.] kineticEnergy
+     0.22%  CoMD-serial           [.] loadAtomsBuffer
+     0.22%  CoMD-serial           [.] sortAtomsInCell
+     0.22%  CoMD-serial           [.] updateLinkCells
+     0.22%  [kernel.kallsyms]     [k] __alloc_frozen_pages_noprof
+     0.22%  [kernel.kallsyms]     [k] __handle_mm_fault
+     0.22%  [kernel.kallsyms]     [k] __list_del_entry_valid_or_report
+     0.22%  [kernel.kallsyms]     [k] _raw_spin_trylock
+     0.22%  [kernel.kallsyms]     [k] free_unref_folios
+     0.22%  [kernel.kallsyms]     [k] kvfree_call_rcu
+     0.22%  [kernel.kallsyms]     [k] mas_store_gfp
+     0.22%  [kernel.kallsyms]     [k] mas_store_prealloc
+     0.22%  [kernel.kallsyms]     [k] mas_walk
+     0.22%  [kernel.kallsyms]     [k] may_expand_vm
+     0.22%  [kernel.kallsyms]     [k] memcg1_uncharge_batch
+     0.22%  [kernel.kallsyms]     [k] page_counter_try_charge
+     0.22%  [kernel.kallsyms]     [k] unmap_page_range
+     0.22%  [kernel.kallsyms]     [k] up_write
+     0.22%  ld-linux-x86-64.so.2  [.] _dl_map_object_from_fd
+     0.22%  ld-linux-x86-64.so.2  [.] update_active.constprop.0
+     0.22%  libc.so.6             [.] __tz_convert
+     0.22%  libc.so.6             [.] indirect_msort_with_tmp
+     0.22%  libm.so.6             [.] __log_finite@GLIBC_2.15@plt
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

@@ -1,0 +1,20 @@
+# started on Thu Nov  5 20:21:34 2026
+
+
+ Performance counter stats for '/work/comd/src/bin/CoMD-serial -x 6 -y 6 -z 6 -N 10' (3 runs):
+
+             33.64 msec task-clock                       #    0.361 CPUs utilized               ( +- 15.40% )
+                 1      context-switches                 #   29.723 /sec                        ( +- 33.33% )
+                 0      cpu-migrations                   #    0.000 /sec                      
+              1101      page-faults                      #   32.725 K/sec                     
+   <not supported>      cycles                                                                
+   <not supported>      instructions                                                          
+   <not supported>      branches                                                              
+   <not supported>      branch-misses                                                         
+   <not supported>      L1-dcache-loads                                                       
+   <not supported>      L1-dcache-load-misses                                                 
+   <not supported>      LLC-loads                                                             
+   <not supported>      LLC-load-misses                                                       
+
+            0.0931 +- 0.0319 seconds time elapsed  ( +- 34.29% )
+

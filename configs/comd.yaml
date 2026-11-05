@@ -9,9 +9,24 @@ flags: -O3 -g -fno-omit-frame-pointer
 build:
   # The upstream build expects Makefile.vanilla copied to Makefile (an untracked file, so no
   # upstream file changes). Variables are overridden on the command line: serial, no MPI.
+  # The serial and MPI builds share object files in src-mpi, so each starts with "make clean".
   - cp src/src-mpi/Makefile.vanilla src/src-mpi/Makefile
+  - make -C src/src-mpi clean
   - make -C src/src-mpi -j DO_MPI=OFF CC="$SAGE_COMPILER" OPTFLAGS="$SAGE_FLAGS"
 binary: src/bin/CoMD-serial
 # Lennard-Jones potential, 30^3 unit cells (108,000 atoms), 100 steps. About 15 s on one core.
 run: "{binary} -x 30 -y 30 -z 30 -N 100"
 env: {}
+
+# MPI variant: scripts/build_target.sh comd --mpi, scripts/profile_target.sh comd <id> --ranks N.
+mpi:
+  compiler: mpicc
+  build:
+    - cp src/src-mpi/Makefile.vanilla src/src-mpi/Makefile
+    - make -C src/src-mpi clean
+    - make -C src/src-mpi -j DO_MPI=ON CC="$SAGE_COMPILER" OPTFLAGS="$SAGE_FLAGS"
+  binary: src/bin/CoMD-mpi
+  launcher: mpirun -np {ranks}  # Open MPI / MPICH; for MPICH, mpiexec -n {ranks} also works
+  # The decomposition -i x -j x -k must equal the rank count. -x/-y/-z are the global lattice.
+  ranks: 4
+  run: "{binary} -i 2 -j 2 -k 1 -x 40 -y 40 -z 40 -N 100"

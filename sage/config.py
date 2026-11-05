@@ -14,7 +14,9 @@ import yaml
 
 TARGETS = ("comd", "lulesh")
 REQUIRED = ("target", "repo_url", "commit", "compiler", "flags", "build", "binary", "run")
-OPTIONAL = ("env",)
+OPTIONAL = ("env", "mpi")
+MPI_REQUIRED = ("compiler", "build", "binary", "launcher", "ranks", "run")
+MPI_OPTIONAL = ("env",)
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 COMMIT = re.compile(r"[0-9a-f]{40}")
 OPTIMIZED = re.compile(r"-O([1-3]|s|fast)")
@@ -26,16 +28,28 @@ class ConfigError(Exception):
 
 
 @dataclass(frozen=True)
+class MpiConfig:
+    compiler: str  # e.g. mpicxx; replaces the top-level compiler for the MPI build
+    build: list[str]
+    binary: str
+    launcher: str  # e.g. "mpirun -np {ranks}"
+    ranks: int  # the rank count the default MPI run command is written for
+    run: str
+    env: dict[str, str] = field(default_factory=dict)  # added to (and overriding) the top-level env
+
+
+@dataclass(frozen=True)
 class TargetConfig:
     target: str
     repo_url: str
     commit: str
     compiler: str  # exported to the build commands as $SAGE_COMPILER
-    flags: str  # exported to the build commands as $SAGE_FLAGS
+    flags: str  # exported to the build commands as $SAGE_FLAGS (shared by the MPI build)
     build: list[str]  # shell commands, run in order from .work/<target>/
     binary: str  # path relative to .work/<target>/
     run: str  # default run command; "{binary}" expands to the binary's absolute path
     env: dict[str, str] = field(default_factory=dict)
+    mpi: MpiConfig | None = None
 
     def run_command(self, work: Path) -> str:
         return self.run.format(binary=work / self.binary)
@@ -55,15 +69,18 @@ def load_config(path: Path, target: str) -> TargetConfig:
     errors = validate(data, target)
     if errors:
         raise ConfigError(f"invalid config {path}:\n" + "\n".join(f"  - {e}" for e in errors))
-    env = {k: str(v) for k, v in (data.get("env") or {}).items()}
-    return TargetConfig(**{k: data[k] for k in REQUIRED}, env=env)
+    env = lambda d: {k: str(v) for k, v in (d.get("env") or {}).items()}
+    mpi = data.get("mpi")
+    return TargetConfig(
+        **{k: data[k] for k in REQUIRED}, env=env(data),
+        mpi=MpiConfig(**{k: mpi[k] for k in MPI_REQUIRED}, env=env(mpi)) if mpi else None,
+    )
 
 
 def validate(data: object, target: str) -> list[str]:
     if not isinstance(data, dict):
         return ["top level must be a mapping of keys to values"]
-    errors = [f"missing required key '{k}'" for k in REQUIRED if k not in data]
-    errors += [f"unknown key '{k}'" for k in data if k not in REQUIRED + OPTIONAL]
+    errors = keys(data, REQUIRED, OPTIONAL)
 
     if "target" in data:
         if data["target"] not in TARGETS:
@@ -82,11 +99,6 @@ def validate(data: object, target: str) -> list[str]:
         if not isinstance(commit, str) or not COMMIT.fullmatch(commit):
             errors.append(f"commit must be a full 40-character lowercase git SHA, got {commit!r}")
 
-    if "compiler" in data:
-        compiler = data["compiler"]
-        if not isinstance(compiler, str) or not compiler or any(c.isspace() for c in compiler):
-            errors.append(f"compiler must be a single command name or path, got {compiler!r}")
-
     if "flags" in data:
         flags = data["flags"]
         tokens = shlex.split(flags) if isinstance(flags, str) else []
@@ -99,70 +111,121 @@ def validate(data: object, target: str) -> list[str]:
         if missing:
             errors.append(f"flags must include {' and '.join(missing)} so perf can resolve symbols and stacks")
 
+    errors += build_fields(data, "")
+
+    if data.get("mpi") is not None:
+        mpi = data["mpi"]
+        if not isinstance(mpi, dict):
+            errors.append("mpi must be a mapping")
+        else:
+            errors += keys(mpi, MPI_REQUIRED, MPI_OPTIONAL, "mpi.")
+            errors += build_fields(mpi, "mpi.")
+            if "launcher" in mpi and placeholders(mpi["launcher"]) != {"ranks"}:
+                errors.append("mpi.launcher must be a command string using the {ranks} placeholder "
+                              "and no other {…} fields, e.g. 'mpirun -np {ranks}'")
+            if "ranks" in mpi and (isinstance(mpi["ranks"], bool) or not isinstance(mpi["ranks"], int)
+                                   or mpi["ranks"] < 1):
+                errors.append(f"mpi.ranks must be a positive integer, got {mpi['ranks']!r}")
+    return errors
+
+
+def keys(data: dict, required: tuple, optional: tuple, prefix: str = "") -> list[str]:
+    return ([f"missing required key '{prefix}{k}'" for k in required if k not in data]
+            + [f"unknown key '{prefix}{k}'" for k in data if k not in required + optional])
+
+
+def placeholders(text: object) -> set[str] | None:
+    """The {…} field names used in ``text``; None if it is not a non-empty, well-formed string."""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    try:
+        return {f for _, f, _, _ in string.Formatter().parse(text) if f is not None}
+    except ValueError:
+        return None
+
+
+def build_fields(data: dict, prefix: str) -> list[str]:
+    """Checks shared by the top level and the mpi section: compiler, build, binary, run, env."""
+    errors = []
+    if "compiler" in data:
+        compiler = data["compiler"]
+        if not isinstance(compiler, str) or not compiler or any(c.isspace() for c in compiler):
+            errors.append(f"{prefix}compiler must be a single command name or path, got {compiler!r}")
+
     if "build" in data:
         build = data["build"]
         if not isinstance(build, list) or not build:
-            errors.append("build must be a non-empty list of shell commands")
+            errors.append(f"{prefix}build must be a non-empty list of shell commands")
         elif not all(isinstance(c, str) and c.strip() for c in build):
-            errors.append("every build command must be a non-empty string")
+            errors.append(f"every {prefix}build command must be a non-empty string")
         else:
             for var in ("SAGE_COMPILER", "SAGE_FLAGS"):
                 if not any(re.search(rf"\$\{{?{var}\b", c) for c in build):
-                    errors.append(f"build commands must use ${var}, or the recorded build info would be wrong")
+                    errors.append(f"{prefix}build commands must use ${var}, or the recorded build info would be wrong")
 
     if "binary" in data:
         binary = data["binary"]
         if not isinstance(binary, str) or not binary.strip():
-            errors.append("binary must be a non-empty path")
+            errors.append(f"{prefix}binary must be a non-empty path")
         elif PurePosixPath(binary).is_absolute() or ".." in PurePosixPath(binary).parts:
-            errors.append(f"binary must be a relative path inside .work/<target>/, got {binary!r}")
+            errors.append(f"{prefix}binary must be a relative path inside .work/<target>/, got {binary!r}")
 
     if "run" in data:
         run = data["run"]
         if not isinstance(run, str) or not run.strip():
-            errors.append("run must be a non-empty command string")
-        else:
-            try:
-                fields = {f for _, f, _, _ in string.Formatter().parse(run) if f is not None}
-            except ValueError as e:
-                fields = None
-                errors.append(f"run has malformed braces: {e}")
-            if fields is not None and fields != {"binary"}:
-                errors.append("run must use the {binary} placeholder and no other {…} fields")
+            errors.append(f"{prefix}run must be a non-empty command string")
+        elif placeholders(run) is None:
+            errors.append(f"{prefix}run has malformed braces")
+        elif placeholders(run) != {"binary"}:
+            errors.append(f"{prefix}run must use the {{binary}} placeholder and no other {{…}} fields")
 
     if data.get("env") is not None:
         env = data["env"]
         if not isinstance(env, dict):
-            errors.append("env must be a mapping of variable names to values")
+            errors.append(f"{prefix}env must be a mapping of variable names to values")
         else:
             for k, v in env.items():
                 if not isinstance(k, str) or not ENV_NAME.fullmatch(k):
-                    errors.append(f"env name {k!r} is not a valid variable name")
+                    errors.append(f"{prefix}env name {k!r} is not a valid variable name")
                 elif k.startswith("SAGE_"):
-                    errors.append(f"env name {k!r} uses the reserved SAGE_ prefix")
+                    errors.append(f"{prefix}env name {k!r} uses the reserved SAGE_ prefix")
                 if isinstance(v, bool) or not isinstance(v, (str, int, float)):
-                    errors.append(f"env value for {k!r} must be a string or number")
+                    errors.append(f"{prefix}env value for {k!r} must be a string or number")
     return errors
 
 
-def shell_exports(cfg: TargetConfig) -> str:
-    """Bash assignments for scripts/build_target.sh (``eval``-ed there)."""
+def shell_exports(cfg: TargetConfig, mpi: bool = False) -> str:
+    """Bash assignments for the scripts in scripts/ (``eval``-ed there).
+
+    With ``mpi`` the MPI variant's compiler, build, binary, run command and env are used.
+    """
+    if mpi and cfg.mpi is None:
+        raise ConfigError(f"config for {cfg.target} has no mpi section")
+    v = cfg.mpi if mpi else cfg
+    values = {
+        "target": cfg.target, "repo_url": cfg.repo_url, "commit": cfg.commit, "flags": cfg.flags,
+        "variant": "mpi" if mpi else "serial", "compiler": v.compiler, "binary": v.binary, "run": v.run,
+        "launcher": cfg.mpi.launcher if mpi else "", "ranks": str(cfg.mpi.ranks) if mpi else "",
+    }
     q = shlex.quote
-    lines = [f"SAGE_{k.upper()}={q(getattr(cfg, k))}"
-             for k in ("target", "repo_url", "commit", "compiler", "flags", "binary")]
-    lines.append("SAGE_BUILD=(" + " ".join(q(c) for c in cfg.build) + ")")
-    lines += [f"export {k}={q(v)}" for k, v in cfg.env.items()]
+    lines = [f"SAGE_{k.upper()}={q(val)}" for k, val in values.items()]
+    lines.append("SAGE_BUILD=(" + " ".join(q(c) for c in v.build) + ")")
+    env = {**cfg.env, **(cfg.mpi.env if mpi else {})}
+    lines.append("SAGE_ENV_NAMES=(" + " ".join(q(k) for k in env) + ")")
+    lines += [f"export {k}={q(val)}" for k, val in env.items()]
     return "\n".join(lines)
 
 
 def main(argv: list[str] | None = None) -> int:
-    """``python -m sage.config CONFIG TARGET``: validate, then print shell assignments."""
+    """``python -m sage.config CONFIG TARGET [--mpi]``: validate, then print shell assignments."""
     args = sys.argv[1:] if argv is None else argv
+    mpi = "--mpi" in args
+    args = [a for a in args if a != "--mpi"]
     if len(args) != 2:
-        print("usage: python -m sage.config CONFIG TARGET", file=sys.stderr)
+        print("usage: python -m sage.config CONFIG TARGET [--mpi]", file=sys.stderr)
         return 2
     try:
-        print(shell_exports(load_config(Path(args[0]), args[1])))
+        print(shell_exports(load_config(Path(args[0]), args[1]), mpi=mpi))
     except ConfigError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2

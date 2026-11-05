@@ -244,3 +244,21 @@ def test_build_usage_errors(tmp_path):
     assert r.returncode == 2 and "usage:" in r.stderr
     r = subprocess.run([BASH, str(BUILD), "lulesh", "--bogus"], capture_output=True, text=True)
     assert r.returncode == 2 and "unknown option" in r.stderr
+
+
+def test_mpi_variant_build_records_separately(project):
+    cfg = {**project["config"], "mpi": {
+        "compiler": project["config"]["compiler"], "build": ['mkdir -p build-mpi && "$SAGE_COMPILER" $SAGE_FLAGS -o build-mpi/app src/main.c'],
+        "binary": "build-mpi/app", "launcher": "mpirun -np {ranks}", "ranks": 4, "run": "{binary}"}}
+    assert build(project, config=cfg).returncode == 0  # serial
+    r = build(project, "--mpi", config=cfg)
+    assert r.returncode == 0, r.stderr
+    work = project["work"] / "lulesh"
+    serial = json.loads((work / "build-info.json").read_text())
+    mpi = json.loads((work / "build-info-mpi.json").read_text())
+    assert serial["variant"] == "serial" and "mpi" not in serial
+    assert mpi["variant"] == "mpi" and mpi["binary"] == str(work / "build-mpi" / "app")
+    assert mpi["mpi"]["launcher"] == "mpirun -np {ranks}" and mpi["mpi"]["default_ranks"] == 4
+    assert "(mpi)" in (work / "build-mpi.log").read_text() and "(serial)" in (work / "build.log").read_text()
+    r = build(project, "--mpi")  # the fixture's own config has no mpi section
+    assert r.returncode == 2 and "has no mpi section" in r.stderr

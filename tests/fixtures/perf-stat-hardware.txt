@@ -1,0 +1,24 @@
+# started on Mon Nov  2 10:14:07 2026
+
+
+ Performance counter stats for '/work/lulesh/build/lulesh2.0 -s 30 -i 100' (3 runs):
+
+         24,218.37 msec task-clock                       #    3.874 CPUs utilized               ( +-  0.41% )
+               412      context-switches                 #   17.012 /sec                        ( +-  6.12% )
+                 3      cpu-migrations                   #    0.124 /sec                        ( +- 33.33% )
+            17,904      page-faults                      #  739.268 /sec                        ( +-  0.02% )
+    87,113,562,903      cycles                           #    3.597 GHz                         ( +-  0.40% )  (71.42%)
+    96,450,118,027      instructions                     #    1.11  insn per cycle              ( +-  0.03% )  (71.43%)
+     8,215,603,322      branches                         #  339.231 M/sec                       ( +-  0.03% )  (71.43%)
+        41,077,014      branch-misses                    #    0.50% of all branches             ( +-  0.21% )  (71.43%)
+    34,904,882,519      L1-dcache-loads                  #    1.441 G/sec                       ( +-  0.04% )  (71.43%)
+     2,268,817,364      L1-dcache-load-misses            #    6.50% of all L1-dcache accesses   ( +-  0.09% )  (71.43%)
+       376,301,446      LLC-loads                        #   15.538 M/sec                       ( +-  0.31% )  (57.14%)
+   <not counted>      LLC-load-misses                                                         (0.00%)
+            TopdownL1                 #     35.2 %  tma_backend_bound
+                                                  #      6.1 %  tma_bad_speculation
+                                                  #     28.9 %  tma_frontend_bound
+                                                  #     29.8 %  tma_retiring
+
+            6.2512 +- 0.0254 seconds time elapsed  ( +-  0.41% )
+

@@ -153,3 +153,62 @@ def test_module_entry_point(tmp_path, capsys):
     assert main([str(write(tmp_path, VALID)), "comd"]) == 2
     assert "but --target is 'comd'" in capsys.readouterr().err
     assert main([]) == 2
+
+
+MPI = {
+    "compiler": "mpicxx",
+    "build": ['cmake -S src -B build-mpi -DCMAKE_CXX_COMPILER="$SAGE_COMPILER" -DCMAKE_CXX_FLAGS="$SAGE_FLAGS"'],
+    "binary": "build-mpi/lulesh2.0", "launcher": "mpirun -np {ranks}", "ranks": 8,
+    "run": "{binary} -s 20", "env": {"OMP_NUM_THREADS": 1},
+}
+
+
+@pytest.mark.parametrize("target", ["lulesh", "comd"])
+def test_shipped_configs_have_mpi_variants(target):
+    mpi = load_config(CONFIGS / f"{target}.yaml", target).mpi
+    assert mpi.compiler.startswith("mpi") and "{ranks}" in mpi.launcher and mpi.ranks >= 1
+    assert mpi.binary != load_config(CONFIGS / f"{target}.yaml", target).binary
+
+
+def test_mpi_section_loads(tmp_path):
+    cfg = load_config(write(tmp_path, {**VALID, "mpi": MPI}), "lulesh")
+    assert cfg.mpi.ranks == 8 and cfg.mpi.env == {"OMP_NUM_THREADS": "1"} and cfg.mpi.launcher == "mpirun -np {ranks}"
+    assert load_config(write(tmp_path, VALID), "lulesh").mpi is None
+
+
+@pytest.mark.parametrize("change,message", [
+    ({"ranks": 0}, "mpi.ranks must be a positive integer"),
+    ({"ranks": True}, "mpi.ranks must be a positive integer"),
+    ({"ranks": "8"}, "mpi.ranks must be a positive integer"),
+    ({"launcher": "mpirun -np 8"}, "mpi.launcher must be a command string using the {ranks} placeholder"),
+    ({"launcher": "mpirun -np {n}"}, "mpi.launcher must be a command string using the {ranks} placeholder"),
+    ({"binary": "/abs/lulesh"}, "mpi.binary must be a relative path"),
+    ({"compiler": "mpicxx -O2"}, "mpi.compiler must be a single command name"),
+    ({"build": ["make"]}, "mpi.build commands must use $SAGE_COMPILER"),
+    ({"run": "./lulesh"}, "mpi.run must use the {binary} placeholder"),
+    ({"env": {"SAGE_X": 1}}, "mpi.env name 'SAGE_X' uses the reserved SAGE_ prefix"),
+    ({"extra": 1}, "unknown key 'mpi.extra'"),
+])
+def test_invalid_mpi_section(tmp_path, change, message):
+    assert message in errors_for(tmp_path, {**VALID, "mpi": {**MPI, **change}})
+
+
+def test_mpi_section_missing_keys_and_type(tmp_path):
+    msg = errors_for(tmp_path, {**VALID, "mpi": {"compiler": "mpicc"}})
+    for key in ("build", "binary", "launcher", "ranks", "run"):
+        assert f"missing required key 'mpi.{key}'" in msg
+    assert "mpi must be a mapping" in errors_for(tmp_path, {**VALID, "mpi": ["mpirun"]})
+
+
+def test_shell_exports_for_mpi_variant(tmp_path):
+    cfg = load_config(write(tmp_path, {**VALID, "mpi": MPI}), "lulesh")
+    script = shell_exports(cfg, mpi=True) + '\nprintf "%s|" "$SAGE_VARIANT" "$SAGE_COMPILER" "$SAGE_BINARY" ' \
+        '"$SAGE_LAUNCHER" "$SAGE_RANKS" "$SAGE_RUN" "$OMP_NUM_THREADS" "$SAGE_FLAGS"'
+    out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True).stdout
+    assert out == f"mpi|mpicxx|build-mpi/lulesh2.0|mpirun -np {{ranks}}|8|{{binary}} -s 20|1|{VALID['flags']}|"
+    serial = subprocess.run(["bash", "-c", shell_exports(cfg) + '\necho "$SAGE_VARIANT $OMP_NUM_THREADS"'],
+                            capture_output=True, text=True, check=True).stdout
+    assert serial.strip() == "serial 4"
+    with pytest.raises(ConfigError, match="no mpi section"):
+        shell_exports(load_config(write(tmp_path, VALID), "lulesh"), mpi=True)
+    assert main([str(write(tmp_path, VALID)), "lulesh", "--mpi"]) == 2

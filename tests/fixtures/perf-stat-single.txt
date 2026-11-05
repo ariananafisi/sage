@@ -1,0 +1,15 @@
+# started on Mon Nov  2 10:20:00 2026
+
+
+ Performance counter stats for '/work/comd/src/bin/CoMD-serial -N 10':
+
+            512.03 msec task-clock                       #    0.998 CPUs utilized
+                 2      context-switches                 #    3.906 /sec
+   <not supported>      cycles
+
+       0.513091734 seconds time elapsed
+
+       0.498212000 seconds user
+       0.014003000 seconds sys
+
+

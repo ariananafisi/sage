@@ -10,8 +10,13 @@ For a given target, SAGE:
 1. runs preflight checks for perf, compilers, the CPU and perf event support (`scripts/preflight.sh`),
 2. checks out the official upstream repository at a pinned commit and builds it with optimization,
    `-g` and `-fno-omit-frame-pointer` (`scripts/build_target.sh`),
-3. hands the binary and the preflight results to the agent. The agent runs `perf stat`, `perf record` and
-   `perf annotate`, reads the hot source code, and writes a Markdown report.
+3. records a baseline perf artifact set for one run: `perf stat` with 3 repeats, `perf record`, and a
+   self-time report, plus metadata (`scripts/profile_target.sh`),
+4. hands the artifacts and the preflight results to the agent. The agent annotates the hot symbols
+   (`scripts/annotate_symbol.sh`), runs further perf experiments, reads the hot source code, and
+   writes a Markdown report.
+
+Each step is also a standalone script you can run yourself.
 
 The application's source code is never modified.
 
@@ -20,8 +25,17 @@ The application's source code is never modified.
 ### 1. Prerequisites
 
 - Linux, with Python 3.10 or newer and `git`
-- A C/C++ toolchain with OpenMP (`gcc`/`g++`), plus `make` and `cmake`. MPI is **not** needed:
-  both targets are built serial.
+- A C/C++ toolchain with OpenMP (`gcc`/`g++`), plus `make` and `cmake`.
+- MPI is optional. The default builds and runs are serial. To build and profile the MPI
+  variants (`--mpi`), you need an MPI implementation with `mpicc`, `mpicxx` and `mpirun`:
+
+  ```bash
+  sudo apt install openmpi-bin libopenmpi-dev
+  ```
+
+  The configs' launchers use Open MPI syntax; see [MPI runs](#mpi-runs). Open MPI refuses to
+  run as root unless `OMPI_ALLOW_RUN_AS_ROOT=1` and `OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1` are set,
+  as in some containers.
 - `perf`, for example:
 
   ```bash
@@ -106,6 +120,10 @@ scripts/build_target.sh lulesh
 scripts/build_target.sh comd --clean
 ```
 
+```bash
+scripts/build_target.sh comd --mpi
+```
+
 The script validates the config, clones the upstream (or reuses `.work/<target>/src`), checks
 out the pinned commit, and runs the build commands. `--clean` deletes `.work/<target>/` first.
 It writes:
@@ -115,6 +133,8 @@ It writes:
 - `.work/<target>/build-info.json`: the commit, repo URL, compiler and compiler version, flags,
   build commands, binary path, cmake and make versions, and the time of the build.
   It is written only when the build succeeds.
+- `--mpi` builds the config's MPI variant and writes `build-mpi.log` and `build-info-mpi.json`
+  instead, so the serial and MPI records never overwrite each other.
 
 A failed build exits 1, prints the last lines of the log, and gives the log's path. A bad
 config exits 2.
@@ -126,7 +146,79 @@ targets currently build unmodified, using only command-line variables. CoMD's
 future build needs a source change, it should be stored as a patch file in this repository and
 applied explicitly. No patch is needed today, so there is no patch mechanism yet.
 
-### 6. Run
+### 6. Profile a run (optional)
+
+`analyze` creates the baseline this way too:
+
+```bash
+scripts/profile_target.sh comd baseline --label "default size"
+```
+
+```bash
+scripts/profile_target.sh lulesh small --cmd "{binary} -s 20 -i 50"
+```
+
+```bash
+scripts/annotate_symbol.sh baseline ljForce
+```
+
+The target must already be built. `profile_target.sh <target> <run-id>` creates
+`runs/<run-id>/`. An existing run directory is never overwritten.
+
+| File | Contents |
+| --- | --- |
+| `metadata.json` | run id, label, status (and error if a step failed), start/end times, the script's command line, the run command, wall-clock times (whole script, each perf step, and the app's mean ± variance over the 3 repeats), perf version and the exact perf commands, the parsed perf stat and report summaries, the build record, CPU details (`/proc/cpuinfo`, `lscpu`), thread settings (CPU affinity, `OMP_*`/`MKL_*`/... variables, MPI ranks), the environment, and a list of artifacts |
+| `stdout.log`, `stderr.log` | output of every execution, with a header line per step. `stderr.log` also holds perf's own messages |
+| `perf-stat.txt` | `perf stat -r 3 -d`: default and cache events, mean and variance over 3 repeats |
+| `perf.data` | `perf record -g` samples with frame-pointer call graphs |
+| `perf-report.txt` | `perf report --no-children --sort overhead,dso,sym`: self time per DSO and symbol, highest first |
+
+Options:
+
+- `--label TEXT`: a note stored in the metadata.
+- `--cmd COMMAND`: replaces the config's run command; `{binary}` expands to the binary.
+- `--ranks N`: an MPI run.
+- `--runs DIR`: where the run directory goes.
+- `--config`, `--work`: as for `build_target.sh`.
+
+Environment variables whose names look like secrets (`*KEY*`, `*TOKEN*`, `*SECRET*`, `*PASS*`,
+`*PROXY*`, and similar) are recorded as `<redacted>`.
+
+Each step must succeed before the next one runs. If perf, or the application under perf, fails,
+the script stops and exits 1. It prints which step failed, with its exit code and the last lines
+of `stderr.log`, and records `"status": "failed"` and the error in `metadata.json`. A report with
+no samples also counts as a failure. Bad arguments, an existing run id or a bad config exit 2,
+and nothing is written.
+
+`annotate_symbol.sh <run-id> <symbol>` saves `perf annotate --stdio` (source interleaved with
+disassembly and sample percentages) to `runs/<run-id>/annotate/<symbol>.txt`. If the symbol has
+no samples, it exits 1 and points to `perf-report.txt` for valid names. For MPI runs, pass
+`--rank R`.
+
+#### MPI runs
+
+`--ranks N` uses the config's `mpi` section. The application runs under the configured launcher,
+for example `mpirun -np N`.
+
+- `perf stat` measures the whole job: the launcher plus all ranks, aggregated.
+- `perf record` runs once per rank, through a small wrapper (`perf-rank-wrapper.sh` in the run
+  directory). The wrapper reads the rank from the MPI runtime (`OMPI_COMM_WORLD_RANK`,
+  `PMIX_RANK`, `PMI_RANK`, `MV2_COMM_WORLD_RANK` or `SLURM_PROCID`).
+- Each rank gets `rank-<r>/perf.data` and `rank-<r>/perf-report.txt` instead of the top-level pair.
+- `metadata.json` holds a parsed report per rank.
+
+The config's MPI run command is written for `mpi.ranks` ranks, because LULESH needs a cube number
+of ranks and CoMD's `-i/-j/-k` decomposition must multiply to the rank count. Any other `--ranks`
+needs a matching `--cmd`:
+
+```bash
+scripts/profile_target.sh comd mpi8 --ranks 8 --cmd "{binary} -i 2 -j 2 -k 2 -x 40 -y 40 -z 40 -N 100"
+```
+
+LULESH's default is 8 ranks with `--oversubscribe`. On a machine with fewer than 8 cores, the
+ranks share cores, and much of the profile will be MPI busy-waiting rather than computation.
+
+### 7. Run the agent
 
 Run from the repository root, since `.work/` and `runs/` are created in the current directory:
 
@@ -138,8 +230,23 @@ bottleneck-agent analyze --target lulesh --config configs/lulesh.yaml
 bottleneck-agent analyze --target comd --config configs/comd.yaml --goal "memory behaviour of the force loop"
 ```
 
-Options: `--model` sets the Claude model (default: the SDK's default). `--max-turns` sets the
-agent's turn limit (default 80). `--goal` adds a focus for the analysis.
+```bash
+bottleneck-agent analyze --target comd --config configs/comd.yaml --mpi --run-id comd-mpi-1
+```
+
+Options:
+
+- `--run-id`: the run directory name (default `<target>-<timestamp>`). The CLI rejects an
+  existing one before doing anything.
+- `--label`: stored in `metadata.json`.
+- `--mpi`: build and profile the MPI variant with the config's default rank count.
+- `--model`: the Claude model (default: the SDK's default).
+- `--max-turns`: the agent's turn limit (default 80).
+- `--goal`: an extra focus for the analysis.
+
+The agent works in `runs/<run-id>/`. It starts from the baseline artifact set, saves
+annotations there, and puts further artifact sets under `runs/<run-id>/experiments/`.
+The report is saved as `runs/<run-id>/report.md`.
 
 ## Layout
 
@@ -149,8 +256,10 @@ configs/lulesh.yaml, configs/comd.yaml   target configs
 .work/<target>/src/                      upstream checkout at the pinned commit (read-only to the agent)
 .work/<target>/build.log                 output of the build commands
 .work/<target>/build-info.json           commit, compiler version, flags and tools of the last good build
-.work/<target>/...                       build outputs (e.g. .work/lulesh/build/)
-runs/<target>-<timestamp>/               agent working directory: perf.data, logs, report.md
+.work/<target>/build-mpi.log, build-info-mpi.json   the same for the MPI variant
+.work/<target>/...                       build outputs (e.g. .work/lulesh/build/, build-mpi/)
+runs/<run-id>/                           one artifact set (see above); for analyze also the agent's
+                                         working directory, with annotate/, experiments/, report.md
 ```
 
 `.work/` and `runs/` are git-ignored. A later run reuses the checkout and rebuilds incrementally.
@@ -173,6 +282,7 @@ API. All problems are reported together.
 | `binary` | yes | path to the built binary, relative to `.work/<target>/` |
 | `run` | yes | default run command; `{binary}` expands to the binary's absolute path |
 | `env` | no | environment variables for the build, the agent and its runs (names may not start with `SAGE_`) |
+| `mpi` | no | MPI variant: `compiler` (e.g. `mpicxx`), `build`, `binary` and `run` (same rules as above), `launcher` (must use `{ranks}`, e.g. `mpirun -np {ranks}`), `ranks` (the rank count `run` is written for), and optional `env` added on top of the top-level `env`. It shares `flags` with the serial build |
 
 Pinned upstreams (both URLs checked with `git ls-remote` when they were added):
 
@@ -206,7 +316,9 @@ on a 4-core machine. The agent adjusts the size if a run is far outside 5–30 s
   see, such as a write from inside `python -c`.
 
 Code: `scripts/preflight.sh` and `scripts/build_target.sh` (machine checks, checkout and build),
-`sage/config.py` (config loading and validation, also used by the build script),
+`scripts/profile_target.sh` and `scripts/annotate_symbol.sh` (perf artifact sets),
+`sage/config.py` (config loading and validation, also used by the scripts),
+`sage/artifacts.py` (perf stat and report parsers and the `metadata.json` writer),
 `sage/agent.py` (the agent and the CLI), `sage/guard.py` (the safety rails).
 
 ## Exit codes
@@ -214,16 +326,21 @@ Code: `scripts/preflight.sh` and `scripts/build_target.sh` (machine checks, chec
 | Code | Meaning |
 | --- | --- |
 | 0 | report written |
-| 1 | preflight failed (no usable perf, compiler or events), checkout or build failed, or the agent run failed |
+| 1 | preflight failed (no usable perf, compiler or events), checkout or build failed, baseline profiling failed, or the agent run failed |
 | 2 | invalid command line, target or config |
 | 3 | application source was modified |
 
 ## Tests
 
 The tests need no Anthropic API access, MPI, perf binary, hardware counters, compiler or
-network. The SDK's `query()` is replaced with a fake. perf and the compiler are replaced with
-small fake executables, which simulate machines with full hardware counters, with software
-events only, or with a broken perf. A local git repository stands in for the upstream.
+network. The SDK's `query()` is replaced with a fake. perf, `mpirun` and the compiler are
+replaced with small fake executables, which simulate machines with full hardware counters, with
+software events only, or with a broken perf, and can make any perf step fail. A local git
+repository stands in for the upstream.
+
+The parsers are tested against saved perf output in `tests/fixtures/`. The software-only
+`perf stat`, the report and the annotate output are real output from a VM. The hardware-counter
+and single-run `perf stat` samples follow the same perf 6.x format.
 
 ```bash
 pytest
