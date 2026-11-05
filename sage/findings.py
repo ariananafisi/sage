@@ -157,8 +157,9 @@ def write_report(run_dir: Path) -> Path:
     """Validate RUN_DIR/findings.json and write RUN_DIR/report.md from it."""
     run_dir = Path(run_dir)
     data = load(run_dir)
-    meta_path = run_dir / "metadata.json"
-    metadata = json.loads(meta_path.read_text()) if meta_path.is_file() else None
+    # The baseline's metadata: runs/<id>/baseline/ for analyze runs, the run directory itself otherwise.
+    meta_path = next((p for p in (run_dir / "metadata.json", run_dir / "baseline" / "metadata.json") if p.is_file()), None)
+    metadata = json.loads(meta_path.read_text()) if meta_path else None
     out = run_dir / "report.md"
     out.write_text(render(data, metadata))
     return out

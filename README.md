@@ -5,22 +5,25 @@ built on the [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk/python
 The agent finds performance bottlenecks in the **LULESH** and **CoMD** proxy apps,
 using **Linux perf** as its only profiler.
 
-For a given target, SAGE:
+For a given target, SAGE runs preflight checks for perf, compilers, the CPU and perf event
+support (`scripts/preflight.sh`). If the machine can profile, it starts one agent session. The
+agent follows a fixed workflow:
 
-1. runs preflight checks for perf, compilers, the CPU and perf event support (`scripts/preflight.sh`),
-2. checks out the official upstream repository at a pinned commit and builds it with optimization,
-   `-g` and `-fno-omit-frame-pointer` (`scripts/build_target.sh`),
-3. records a baseline perf artifact set for one run: `perf stat` with 3 repeats, `perf record`, and a
-   self-time report, plus metadata (`scripts/profile_target.sh`),
-4. hands the artifacts and the preflight results to the agent. The agent annotates the hot symbols
-   (`scripts/annotate_symbol.sh`), runs further perf experiments, reads the hot source code, and
-   writes its result as `findings.json`,
-5. validates `findings.json` against a JSON schema, checks that every cited artifact exists in the
-   run directory, and generates `report.md` from it (`python -m sage.findings`).
+1. Check the preflight output, and build the target if needed: `scripts/build_target.sh` checks
+   out the official upstream at a pinned commit and builds it with optimization, `-g` and
+   `-fno-omit-frame-pointer`.
+2. Run the baseline profile with `scripts/profile_target.sh`: `perf stat` with 3 repeats,
+   `perf record`, a self-time report, and metadata.
+3. Inspect the `perf stat` and `perf report` output.
+4. Annotate the top functions (`scripts/annotate_symbol.sh`) and read the matching source.
+5. Form a testable hypothesis.
+6. Run one controlled experiment, changing only one factor.
+7. Write `findings.json` and validate it.
+
+SAGE then validates `findings.json` itself (one retry is allowed), generates `report.md` from it,
+saves the full transcript, and checks that the application's source is unchanged.
 
 Each step is also a standalone script you can run yourself.
-
-The application's source code is never modified.
 
 ## Setup
 
@@ -112,7 +115,7 @@ unsupported, or when `perf_event_paranoid` limits an unprivileged user to user-s
 
 ### 5. Build a target (optional)
 
-`analyze` also runs this itself:
+During `analyze`, the agent runs this itself when the build is missing or stale:
 
 ```bash
 scripts/build_target.sh lulesh
@@ -150,7 +153,7 @@ applied explicitly. No patch is needed today, so there is no patch mechanism yet
 
 ### 6. Profile a run (optional)
 
-`analyze` creates the baseline this way too:
+During `analyze`, the agent creates its baseline and experiments with this script:
 
 ```bash
 scripts/profile_target.sh comd baseline --label "default size"
@@ -238,17 +241,73 @@ bottleneck-agent analyze --target comd --config configs/comd.yaml --mpi --run-id
 
 Options:
 
+Options:
+
 - `--run-id`: the run directory name (default `<target>-<timestamp>`). The CLI rejects an
   existing one before doing anything.
-- `--label`: stored in `metadata.json`.
+- `--label`: stored in the baseline's `metadata.json`.
 - `--mpi`: build and profile the MPI variant with the config's default rank count.
-- `--model`: the Claude model (default: the SDK's default).
-- `--max-turns`: the agent's turn limit (default 80).
 - `--goal`: an extra focus for the analysis.
 
-The agent works in `runs/<run-id>/`. It starts from the baseline artifact set, saves
-annotations there, and puts further artifact sets under `runs/<run-id>/experiments/`.
-Its result is `runs/<run-id>/findings.json`, and SAGE generates `runs/<run-id>/report.md` from it.
+Limits, all validated before anything runs:
+
+| Option | Default | Limits |
+| --- | --- | --- |
+| `--model` | the SDK's default | the Claude model |
+| `--max-turns` | 80 | agent turns, for the analysis and again for the retry |
+| `--timeout` | `60m` | wall-clock time for the whole agent session, retry included (`90s`, `45m`, `1.5h`, or plain seconds) |
+| `--max-experiments` | 1 | experiment artifact sets the agent may create; later attempts are refused |
+
+A run directory looks like this:
+
+```
+runs/<run-id>/
+  baseline/            the baseline artifact set (metadata.json, perf-stat.txt, perf.data,
+                       perf-report.txt, stdout.log, stderr.log, annotate/)
+  experiments/<name>/  one artifact set per experiment
+  findings.json        the agent's result
+  report.md            generated from findings.json
+  transcript.jsonl     the full agent transcript
+```
+
+`transcript.jsonl` has one JSON record per line:
+
+- the start (limits, tools and the system prompt)
+- every prompt sent to the agent
+- every SDK message received (assistant text, tool calls and their results, the final result)
+- each findings.json validation, any errors, a timeout
+- the end status
+
+It is written as the run goes, so it survives a crash or a timeout.
+
+### Prompts
+
+The prompts are in `sage/prompts/`. They are filled in at run time, and a missing or unused value
+is an error.
+
+- `system.md`: the ground rules and the seven-step workflow above.
+- `task.md`: this run's paths, the preflight summary, the exact commands, and the limits.
+- `retry.md`: the follow-up sent when `findings.json` fails validation.
+
+The system prompt tells the agent:
+
+- not to rely on prior knowledge of the application. It must learn options from `--help` and the
+  source, and back every claim with something measured in the run. For the same reason, the prompts
+  contain no application-specific hints.
+- to keep measured facts and inferences apart. `supporting_evidence` holds only facts, each naming
+  its artifact. `likely_cause` and the interpretation in `experiment_result` are inferences and
+  must be worded as such.
+
+### Retry and failure
+
+When the agent finishes, SAGE validates `findings.json` itself. If the file is missing or invalid,
+SAGE sends the problems back to the same agent session once, and the agent fixes the file. If it is
+still invalid, the run fails with exit code 4, lists the remaining problems, and writes no report.
+Hitting the turn limit is handled the same way: the findings are validated, and if they are not
+valid, the retry is used.
+
+Reaching the wall-clock limit stops the agent immediately and exits 5. If a valid `findings.json`
+already exists, the report is still generated.
 
 ## Findings and report
 
@@ -360,46 +419,62 @@ CoMD's original home, `github.com/exmatex/CoMD`, now resolves to `ECP-copa/CoMD`
 Both targets use `-O3 -g -fno-omit-frame-pointer`, so perf can resolve symbols and call graphs.
 The LULESH config sets no `CMAKE_BUILD_TYPE`, so these are the exact compile flags. The build
 log shows the full compile lines. The default run sizes are chosen to take about 10–15 seconds
-on a 4-core machine. The agent adjusts the size if a run is far outside 5–30 seconds.
+on a 4-core machine. The agent notes it in its findings if a run is very short or very long.
 
 ## How the agent is constrained
 
-- **One agent.** It runs as a single `query()` call. `tools=["Bash", "Read", "Glob", "Grep"]` is
-  the agent's whole toolset, so there is no Write or Edit tool and no subagent tool. No custom
-  tools or MCP servers are added. `permission_mode="dontAsk"` refuses anything that is not
-  pre-approved. `setting_sources=[]` means user and project settings, hooks and CLAUDE.md files
-  are not loaded.
+- **One agent.** It runs as one `ClaudeSDKClient` session, used for the analysis and the retry.
+  `tools=["Bash", "Read", "Glob", "Grep", "Write", "Edit"]` is the agent's whole toolset. There is
+  no subagent tool, no web tool, and no custom tools or MCP servers. `permission_mode="dontAsk"`
+  refuses anything that is not pre-approved. `setting_sources=[]` means user and project settings,
+  hooks and CLAUDE.md files are not loaded.
+- **Writing.** Write and Edit work only on `runs/<run-id>/findings.json`. Any other path, or a
+  symlink in its place, is refused. `report.md` is always generated by SAGE: one written by the
+  agent is deleted. The shell can still create perf output and notes, because experiments need it.
+- **Every run is recorded.** The application may only be run through `profile_target.sh`.
+  - Direct `perf stat`/`perf record`/`perf top`/`perf trace` and MPI launchers are denied.
+  - Running the target binary directly is denied, except `--help`/`-h`.
+  - `perf report`, `perf annotate` and `perf script` on existing data are allowed.
+  - Artifact sets may only go to `runs/<run-id>/baseline` or `runs/<run-id>/experiments/`.
+    Experiments beyond `--max-experiments` are refused.
 - **perf only.** A `PreToolUse` hook denies shell commands that call other profilers
   (gprof, valgrind, VTune, likwid, HPCToolkit, Nsight, strace, `-pg`, and others).
-- **Source is read-only.** The same hook denies commands that would edit, move or delete files
-  in the checkout: in-place editors (`sed -i`, `patch`, editors), redirections,
-  `cp`/`mv`/`rm`/`tee`/`dd`, `find -exec`, `bash -c`, and git commands that change the working
-  tree. New files, such as build outputs, are allowed.
-- **Verified afterwards.** SAGE hashes every git-tracked file in the checkout before the build,
-  and checks them again after the agent finishes. This catches writes the command check cannot
-  see, such as a write from inside `python -c`.
+- **Source is read-only.** The same hook denies commands that would edit, move or delete a file
+  git tracks in the checkout. That covers in-place editors (`sed -i`, `patch`, editors),
+  redirections, `cp`/`mv`/`rm`/`tee`/`dd`, `find -exec` and `bash -c`. Only read-only git
+  subcommands are allowed. The tracked files are looked up on every command, because the agent
+  may clone the checkout during the run. New files, such as build outputs, are allowed.
+- **Verified afterwards.** When the session ends, SAGE compares every file of the pinned commit
+  with the checkout by content (`git hash-object` against the commit's tree), and checks HEAD.
+  This catches what the command check cannot see, such as a write from inside `python -c`. It
+  cannot be fooled by git index tricks such as `--assume-unchanged`.
+
+These command checks are best-effort pattern matching on shell text. The content comparison
+after the run is the guarantee for source files.
 
 Code: `scripts/preflight.sh` and `scripts/build_target.sh` (machine checks, checkout and build),
 `scripts/profile_target.sh` and `scripts/annotate_symbol.sh` (perf artifact sets),
 `sage/config.py` (config loading and validation, also used by the scripts),
 `sage/artifacts.py` (perf stat and report parsers and the `metadata.json` writer),
 `sage/findings.py` and `sage/findings.schema.json` (the result format, its validator and the report generator),
-`sage/agent.py` (the agent and the CLI), `sage/guard.py` (the safety rails).
+`sage/agent.py` and `sage/prompts/` (the agent, its prompts, limits and the CLI), `sage/guard.py` (the safety rails).
 
 ## Exit codes
 
 | Code | Meaning |
 | --- | --- |
 | 0 | report written |
-| 1 | preflight failed (no usable perf, compiler or events), checkout or build failed, baseline profiling failed, or the agent run failed |
+| 1 | preflight failed (no usable perf, compiler or events) |
 | 2 | invalid command line, target or config |
 | 3 | application source was modified |
-| 4 | the agent's `findings.json` is missing or invalid; no report was written |
+| 4 | `findings.json` is missing or still invalid after one retry; no report was written |
+| 5 | the wall-clock limit (`--timeout`) was reached |
 
 ## Tests
 
 The tests need no Anthropic API access, MPI, perf binary, hardware counters, compiler or
-network. The SDK's `query()` is replaced with a fake. perf, `mpirun` and the compiler are
+network. `ClaudeSDKClient` is replaced with a fake that plays scripted agent turns. These cover
+prompt loading, limits, the retry, timeouts and the transcript. perf, `mpirun` and the compiler are
 replaced with small fake executables, which simulate machines with full hardware counters, with
 software events only, or with a broken perf, and can make any perf step fail. A local git
 repository stands in for the upstream.

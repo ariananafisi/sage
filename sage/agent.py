@@ -4,95 +4,84 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import json
 import os
 import re
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
+    ClaudeSDKClient,
     HookMatcher,
     ResultError,
     ResultMessage,
     TextBlock,
     ToolUseBlock,
-    query,
 )
 
 from .config import TARGETS, ConfigError, TargetConfig, load_config
-from .findings import SCHEMA_PATH, FindingsError, write_report
-from .guard import changed, make_guard, snapshot
+from .findings import SCHEMA_PATH, FindingsError, load as load_findings, write_report
+from .guard import Policy, make_guard, source_changes
 
-TOOLS = ["Bash", "Read", "Glob", "Grep"]
-
-SYSTEM_PROMPT = """\
-You are SAGE, a performance engineer. Your job is to find and explain the
-performance bottlenecks of an HPC proxy application using Linux perf.
-
-Rules (enforced; violating commands are denied):
-- perf is the only profiler. Do not use gprof, valgrind, VTune, strace, -pg, etc.
-- Never modify the application's source checkout. If you need a different build,
-  configure it only through command-line variables (e.g. `make VAR=value`,
-  `cmake -DVAR=value`) into a new build directory under the work directory.
-- Write perf data, logs and notes in the current directory (the run directory).
-
-Method:
-1. Preflight checks have already run; their results are in the task. If hardware
-   counters are unavailable, use software events (task-clock, cpu-clock) and say
-   so; if topdown metrics are unsupported, do not attempt them.
-2. The binary is already built (optimized, -g, frame pointers), and a baseline
-   artifact set already exists in the current directory: metadata.json (command,
-   timings, CPU, threads, parsed perf summary), perf-stat.txt (perf stat -d, 3
-   repeats), perf.data and perf-report.txt (self time by DSO and symbol; one
-   rank-<r>/ directory per rank for MPI), stdout.log and stderr.log. Start from
-   these; do not re-run the baseline.
-3. For each top hotspot, save its annotation with the annotate_symbol.sh command
-   given in the task, then read it next to the source.
-4. To test a hypothesis, make a new artifact set with the profile_target.sh
-   command given in the task (it writes under experiments/), e.g. a different
-   problem size or thread count via --cmd, or run targeted `perf stat -e` /
-   `perf record` commands writing into the current directory.
-5. For each hotspot, classify the bottleneck (compute-bound, memory-bandwidth/
-   latency-bound, branch mispredictions, poor vectorization, load imbalance /
-   serial sections, MPI communication, etc.), citing the perf evidence. For MPI
-   runs, compare ranks and time spent in MPI libraries.
-
-Result: finish by writing findings.json in the run directory (e.g. with
-`cat > findings.json <<'EOF' ... EOF`), following the JSON schema whose path is in
-the task. report.md is generated from it; do not write report.md yourself.
-- status "bottlenecks_found" needs at least one finding; use "inconclusive" when
-  the evidence does not establish a bottleneck (findings may then be empty).
-- Rank findings 1..n by importance. Every finding needs supporting_evidence with
-  measured numbers, an experiment and its result (say plainly if no extra
-  experiment was run), and artifact_paths: files in the run directory, relative
-  to it, that hold the evidence (perf-report.txt, annotate/<symbol>.txt,
-  experiments/<name>/..., your own perf output files).
-- Put optimization ideas in likely_cause or experiment_result; list what could
-  not be measured in limitations.
-- Run the validate command from the task and fix every reported problem until it
-  passes. Then reply with one line saying findings.json is complete.
-"""
-
-APP_HINTS = {
-    "lulesh": (
-        "The application is LULESH 2.0 (C++, Lagrangian shock hydrodynamics, OpenMP). "
-        "Run the binary with -h for options: -s elements per edge, -i iterations. "
-        "Threads are controlled by OMP_NUM_THREADS."
-    ),
-    "comd": (
-        "The application is CoMD (C, classical molecular dynamics). Run the binary with "
-        "--help for options: -x/-y/-z unit cells, -N steps. The default potential is "
-        "Lennard-Jones; -e selects EAM and needs --potDir <checkout>/pots."
-    ),
-}
-
-
+TOOLS = ["Bash", "Read", "Glob", "Grep", "Write", "Edit"]  # Write/Edit are limited to findings.json by the hook
 SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
+PROMPTS = Path(__file__).resolve().parent / "prompts"
 RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")  # same rule as scripts/profile_target.sh
+PLACEHOLDER = re.compile(r"\{\{\s*(\w+)\s*\}\}")
+
+# Exit codes (also in the README).
+OK, FAILED, USAGE, SOURCE_MODIFIED, INVALID_FINDINGS, TIMED_OUT = 0, 1, 2, 3, 4, 5
+
+
+class PromptError(Exception):
+    pass
+
+
+def load_prompt(name: str, **values: object) -> str:
+    """Fill sage/prompts/<name>.md. Every {{placeholder}} must be given, and every value used."""
+    text = (PROMPTS / f"{name}.md").read_text()
+    used = set(PLACEHOLDER.findall(text))
+    if missing := used - set(values):
+        raise PromptError(f"prompt {name}.md needs values for: {', '.join(sorted(missing))}")
+    if unused := set(values) - used:
+        raise PromptError(f"prompt {name}.md has no placeholders for: {', '.join(sorted(unused))}")
+    return PLACEHOLDER.sub(lambda m: str(values[m.group(1)]), text)
+
+
+@dataclass(frozen=True)
+class Limits:
+    model: str | None = None  # None: the SDK's default model
+    max_turns: int = 80  # per agent turn (the analysis, and the retry)
+    timeout_s: float = 3600  # wall-clock for the whole agent session, retry included
+    max_experiments: int = 1  # experiment artifact sets under <run>/experiments
+
+    def __post_init__(self):
+        if self.model is not None and not self.model.strip():
+            raise ValueError("model must not be empty")
+        if isinstance(self.max_turns, bool) or not isinstance(self.max_turns, int) or self.max_turns < 1:
+            raise ValueError(f"max turns must be a positive integer, got {self.max_turns!r}")
+        if isinstance(self.timeout_s, bool) or not isinstance(self.timeout_s, (int, float)) or not self.timeout_s > 0:
+            raise ValueError(f"timeout must be positive, got {self.timeout_s!r}")
+        if isinstance(self.max_experiments, bool) or not isinstance(self.max_experiments, int) \
+                or self.max_experiments < 0:
+            raise ValueError(f"max experiments must be 0 or more, got {self.max_experiments!r}")
+
+
+def parse_duration(text: str) -> float:
+    """'90', '90s', '45m', '1.5h' -> seconds."""
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([smh]?)\s*", text)
+    if not m:
+        raise ValueError(f"invalid duration {text!r}: use seconds, or a number followed by s, m or h")
+    value = float(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600}[m.group(2)]
+    if value <= 0:
+        raise ValueError(f"duration must be positive, got {text!r}")
+    return value
 
 
 def run_script(name: str, *args: str, cwd: Path) -> int:
@@ -101,164 +90,256 @@ def run_script(name: str, *args: str, cwd: Path) -> int:
     return subprocess.run(["bash", str(SCRIPTS / name), *args], cwd=cwd, env=env).returncode
 
 
-def build_prompt(cfg: TargetConfig, work: Path, run_dir: Path, config_path: Path,
-                 metadata: dict, preflight: dict, goal: str | None) -> str:
-    build, perf, wall = metadata["build"] or {}, metadata["perf"], metadata["wall_clock"]
-    mpi = metadata["mpi"]
-    events = preflight.get("events", {})
-    stat = perf.get("stat") or {}
-    counted = [e["event"] for e in stat.get("events", []) if e["counted"]]
-    missing = [e["event"] for e in stat.get("events", []) if not e["counted"]]
-    lines = [
-        f"Profile {cfg.target.upper()} with perf and report its performance bottlenecks.",
-        "",
-        f"Source checkout (read-only): {work / 'src'}  ({build.get('repo_url')} @ {build.get('commit')})",
-        f"Built binary: {build.get('binary')} ({build.get('variant')} build; compiler {build.get('compiler')}: "
-        f"{build.get('compiler_version')}; flags: {build.get('flags')})",
-        f"Run command: {metadata['run_command']}" + (f"  (launched with: {mpi['launcher']})" if mpi else ""),
-        f"Environment (already set for your commands): "
-        + (" ".join(f"{k}={v}" for k, v in metadata["threads"]["variables"].items()) or "(no thread variables)"),
-        "",
-        "Preflight results (from scripts/preflight.sh; no need to repeat these checks):",
-        f"  CPU: {preflight.get('host', {}).get('cpu_model')} ({preflight.get('host', {}).get('cpus')} CPUs), "
-        f"{preflight.get('perf', {}).get('version')}, perf_event_paranoid={preflight.get('perf_event_paranoid')}",
-        "  events: " + ", ".join(f"{k}={'yes' if v else 'no'}" for k, v in events.items()),
-        *[f"  warning: {w}" for w in preflight.get("warnings", [])],
-        "",
-        f"Baseline artifact set (run id {metadata['run_id']}): {run_dir}",
-        f"  app wall-clock: {wall['app_mean_s']} s mean over {wall['repeats']} runs (+- {wall['app_variance_pct']}%)",
-        f"  perf stat counted: {', '.join(counted) or 'nothing'}; not available: {', '.join(missing) or 'none'}",
-    ]
-    reports = perf["rank_reports"] or {"(all)": perf["report"] or {}}
-    for rank, report in sorted(reports.items(), key=lambda kv: kv[0]):
-        top = ", ".join(f"{r['symbol']} ({r['dso']}) {r['self_pct']}%" for r in report.get("top", [])[:5])
-        lines.append(f"  top self time{'' if rank == '(all)' else f' rank {rank}'} "
-                     f"[{report.get('samples')} samples of {report.get('event')}]: {top}")
-    scripts = SCRIPTS
-    rank_opt = " --rank <r>" if mpi else ""
-    lines += [
-        "",
-        "Commands available to you:",
-        f"  annotate a symbol:  {scripts}/annotate_symbol.sh {metadata['run_id']} <symbol>{rank_opt} --runs {run_dir.parent}",
-        f"  new artifact set:   {scripts}/profile_target.sh {cfg.target} <name> --runs {run_dir}/experiments "
-        f"--work {work.parent} --config {Path(config_path).resolve()}"
-        + (f" --ranks {mpi['ranks']}" if mpi else "") + " [--label TEXT] [--cmd '{binary} <args>']",
-        f"  validate findings:  {sys.executable} -m sage.findings validate {run_dir}",
-        "",
-        f"findings.json schema: {SCHEMA_PATH}",
-    ]
-    if goal:
-        lines += ["", f"Additional focus: {goal}"]
-    return "\n".join(lines)
+@dataclass(frozen=True)
+class Run:
+    """Paths and commands for one analysis."""
+    cfg: TargetConfig
+    config_path: Path
+    root: Path
+    run_id: str
+    mpi: bool = False
+    label: str | None = None
+
+    @property
+    def work_root(self) -> Path: return self.root / ".work"
+    @property
+    def work(self) -> Path: return self.work_root / self.cfg.target
+    @property
+    def src(self) -> Path: return self.work / "src"
+    @property
+    def run_dir(self) -> Path: return self.root / "runs" / self.run_id
+    @property
+    def preflight(self) -> Path: return self.work_root / "preflight.json"
+    @property
+    def variant(self): return self.cfg.mpi if self.mpi else self.cfg
+
+    def commands(self) -> dict[str, str]:
+        config, work = str(Path(self.config_path).resolve()), str(self.work_root)
+        ranks = f" --ranks {self.cfg.mpi.ranks}" if self.mpi else ""
+        rank = " --rank <r>" if self.mpi else ""
+        profile = f"{SCRIPTS}/profile_target.sh {self.cfg.target}"
+        return {
+            "build_command": f"{SCRIPTS}/build_target.sh {self.cfg.target}{' --mpi' if self.mpi else ''} "
+                             f"--config {config} --work {work}",
+            "baseline_command": f"{profile} baseline --runs {self.run_dir} --work {work} --config {config}"
+                                f"{ranks} --label {_quote(self.label or 'baseline')}",
+            "annotate_command": f"{SCRIPTS}/annotate_symbol.sh baseline <symbol>{rank} --runs {self.run_dir}",
+            "experiment_command": f"{profile} <name> --runs {self.run_dir / 'experiments'} --work {work} "
+                                  f"--config {config}{ranks} --label '<the one factor changed>' "
+                                  f"--cmd '{{binary}} <arguments>'",
+            "annotate_experiment_command": f"{SCRIPTS}/annotate_symbol.sh <name> <symbol>{rank} "
+                                           f"--runs {self.run_dir / 'experiments'}",
+            "validate_command": f"{sys.executable} -m sage.findings validate {self.run_dir}",
+        }
+
+    def env(self) -> dict[str, str]:
+        return {**self.cfg.env, **(self.cfg.mpi.env if self.mpi else {}), "PYTHON": sys.executable}
 
 
-def build_options(cfg: TargetConfig, work: Path, run_dir: Path, protected: set[str],
-                  model: str | None, max_turns: int, mpi: bool = False) -> ClaudeAgentOptions:
-    return ClaudeAgentOptions(
-        tools=TOOLS,  # the only built-in tools the agent can see: no Write/Edit, no subagents
-        allowed_tools=TOOLS,
-        permission_mode="dontAsk",  # anything not pre-approved is denied, never prompted
-        system_prompt=SYSTEM_PROMPT + "\n" + APP_HINTS[cfg.target],
-        cwd=str(run_dir),
-        add_dirs=[str(work)],
-        env={**cfg.env, **(cfg.mpi.env if mpi and cfg.mpi else {})},
-        setting_sources=[],  # ignore user/project settings, hooks and CLAUDE.md files
-        hooks={"PreToolUse": [HookMatcher(hooks=[make_guard(protected)])]},
-        model=model,
-        max_turns=max_turns,
+def _quote(text: str) -> str:
+    return "'" + text.replace("'", "'\\''") + "'"
+
+
+def system_prompt(limits: Limits) -> str:
+    return load_prompt("system", max_experiments=limits.max_experiments, max_turns=limits.max_turns,
+                       timeout_minutes=f"{limits.timeout_s / 60:g}")
+
+
+def task_prompt(run: Run, limits: Limits, preflight: dict, goal: str | None) -> str:
+    cfg, variant = run.cfg, run.variant
+    host = preflight.get("host", {})
+    pre = [f"  CPU: {host.get('cpu_model')} ({host.get('cpus')} logical CPUs), {host.get('arch')}, "
+           f"kernel {host.get('kernel')}",
+           f"  perf: {preflight.get('perf', {}).get('version')}; "
+           f"perf_event_paranoid={preflight.get('perf_event_paranoid')}",
+           "  events: " + ", ".join(f"{k}={'yes' if v else 'no'}" for k, v in preflight.get("events", {}).items()),
+           *[f"  warning: {w}" for w in preflight.get("warnings", [])]]
+    mpi_note = (f"This is an MPI analysis with {cfg.mpi.ranks} ranks via '{cfg.mpi.launcher}'. The "
+                "default run command is written for that rank count. Each rank has its own perf.data "
+                "and perf-report.txt under rank-<r>/." if run.mpi else "")
+    return load_prompt(
+        "task", target=cfg.target, variant="MPI" if run.mpi else "serial", run_dir=run.run_dir, src=run.src,
+        repo_url=cfg.repo_url, commit=cfg.commit,
+        build_info=run.work / f"build-info{'-mpi' if run.mpi else ''}.json",
+        run_command=variant.run.format(binary=run.work / variant.binary),
+        environment=" ".join(f"{k}={v}" for k, v in run.env().items() if k != "PYTHON") or "(none)",
+        preflight_path=run.preflight, preflight="\n".join(pre), mpi_note=mpi_note,
+        schema=SCHEMA_PATH, max_experiments=limits.max_experiments, max_turns=limits.max_turns,
+        timeout_minutes=f"{limits.timeout_s / 60:g}", goal=f"\nAdditional focus: {goal}" if goal else "",
+        **run.commands(),
     )
 
 
-async def run(cfg: TargetConfig, config_path: Path, root: Path, run_id: str, *, label: str | None = None,
-              mpi: bool = False, model: str | None = None, max_turns: int = 80, goal: str | None = None) -> int:
-    root = root.resolve()
-    work_root = root / ".work"
-    work = work_root / cfg.target
-    run_dir = root / "runs" / run_id
-    config_arg = str(Path(config_path).resolve())
-    preflight_path = work_root / "preflight.json"
-    if run_script("preflight.sh", "--output", str(preflight_path), cwd=root):
-        print(f"error: preflight failed; see {preflight_path}", file=sys.stderr)
-        return 1
-    if run_script("build_target.sh", cfg.target, *(["--mpi"] if mpi else []), "--config", config_arg,
-                  "--work", str(work_root), cwd=root):
-        print("error: build failed (see the log path above)", file=sys.stderr)
-        return 1
-    source = snapshot(work / "src")
-    profile_args = [cfg.target, run_id, "--config", config_arg, "--work", str(work_root),
-                    "--runs", str(root / "runs")]
-    if label:
-        profile_args += ["--label", label]
-    if mpi:
-        profile_args += ["--ranks", str(cfg.mpi.ranks)]
-    if run_script("profile_target.sh", *profile_args, cwd=root):
-        print(f"error: baseline profiling failed; see {run_dir}", file=sys.stderr)
-        return 1
-    preflight = json.loads(preflight_path.read_text())
-    metadata = json.loads((run_dir / "metadata.json").read_text())
-    options = build_options(cfg, work, run_dir, set(source), model, max_turns, mpi)
-    prompt = build_prompt(cfg, work, run_dir, config_path, metadata, preflight, goal)
+def build_options(run: Run, limits: Limits) -> ClaudeAgentOptions:
+    binaries = [run.cfg.binary] + ([run.cfg.mpi.binary] if run.cfg.mpi else [])
+    policy = Policy(src=run.src, run_dir=run.run_dir, max_experiments=limits.max_experiments,
+                    binaries=frozenset(Path(b).name for b in binaries))
+    return ClaudeAgentOptions(
+        tools=TOOLS,  # the agent's whole toolset: no subagents, no web, no MCP servers
+        allowed_tools=TOOLS,
+        permission_mode="dontAsk",  # anything not pre-approved is denied, never prompted
+        system_prompt=system_prompt(limits),
+        cwd=str(run.run_dir),
+        add_dirs=[str(run.work)],
+        env=run.env(),
+        setting_sources=[],  # ignore user/project settings, hooks and CLAUDE.md files
+        hooks={"PreToolUse": [HookMatcher(hooks=[make_guard(policy)])]},
+        model=limits.model,
+        max_turns=limits.max_turns,
+    )
 
-    status = 0
-    try:
-        async for message in query(prompt=prompt, options=options):
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        print(block.text, file=sys.stderr)
-                    elif isinstance(block, ToolUseBlock):
-                        detail = block.input.get("command") or block.input.get("file_path") or block.input.get("pattern", "")
-                        print(f"[{block.name}] {detail}", file=sys.stderr)
-            elif isinstance(message, ResultMessage) and message.is_error:
-                status = 1
-    except ResultError as e:
-        print(f"error: agent run failed ({e.terminal_reason or e.subtype}): {e}", file=sys.stderr)
-        status = 1
 
-    # The agent's result is findings.json; report.md is generated from it, never written by the agent.
-    (run_dir / "report.md").unlink(missing_ok=True)
+class Transcript:
+    """Append-only JSON Lines record of everything sent to and received from the agent."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.file = path.open("a")
+
+    def write(self, kind: str, **data):
+        record = {"time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "kind": kind, **data}
+        self.file.write(json.dumps(record, default=str) + "\n")
+        self.file.flush()
+
+    def message(self, message):
+        data = dataclasses.asdict(message) if dataclasses.is_dataclass(message) else repr(message)
+        self.write("message", type=type(message).__name__, message=data)
+
+    def close(self):
+        self.file.close()
+
+
+async def agent_turn(client, prompt: str, transcript: Transcript) -> ResultMessage | None:
+    transcript.write("prompt", text=prompt)
+    await client.query(prompt)
+    result = None
+    async for message in client.receive_response():
+        transcript.message(message)
+        if isinstance(message, AssistantMessage):
+            for block in message.content:
+                if isinstance(block, TextBlock):
+                    print(block.text, file=sys.stderr)
+                elif isinstance(block, ToolUseBlock):
+                    detail = block.input.get("command") or block.input.get("file_path") or block.input.get("pattern", "")
+                    print(f"[{block.name}] {detail}", file=sys.stderr)
+        elif isinstance(message, ResultMessage):
+            result = message
+            if message.is_error:
+                print(f"agent: turn ended with an error ({message.subtype}): {message.errors or message.result}",
+                      file=sys.stderr)
+    return result
+
+
+def findings_errors(run_dir: Path) -> list[str]:
     try:
-        report = write_report(run_dir)
-        print(report.read_text())
+        load_findings(run_dir)
+        return []
     except FindingsError as e:
-        print(f"error: {run_dir / 'findings.json'} is missing or invalid:", file=sys.stderr)
-        for error in e.errors:
-            print(f"  - {error}", file=sys.stderr)
-        status = status or 4
-    print(f"run directory: {run_dir}", file=sys.stderr)
+        return e.errors
 
-    violations = changed(source)
-    if violations:
-        print("error: application source was modified:\n  " + "\n  ".join(violations), file=sys.stderr)
-        return 3
+
+async def session(run: Run, limits: Limits, task: str, transcript: Transcript) -> list[str]:
+    """One agent session: the analysis, then at most one retry if findings.json is invalid."""
+    errors: list[str] = []
+    async with ClaudeSDKClient(options=build_options(run, limits)) as client:
+        for attempt in ("analysis", "retry"):
+            prompt = task if attempt == "analysis" else load_prompt(
+                "retry", errors="\n".join(f"- {e}" for e in errors),
+                findings=run.run_dir / "findings.json", validate_command=run.commands()["validate_command"])
+            try:
+                await agent_turn(client, prompt, transcript)
+            except ResultError as e:  # the turn ended with an error result, e.g. max turns
+                transcript.write("error", attempt=attempt, error=str(e), subtype=e.subtype)
+                print(f"agent: {attempt} ended with an error ({e.terminal_reason or e.subtype}): {e}", file=sys.stderr)
+            errors = findings_errors(run.run_dir)
+            transcript.write("validation", attempt=attempt, errors=errors)
+            if not errors:
+                return []
+            if attempt == "analysis":
+                print(f"findings.json is invalid ({len(errors)} problem(s)); asking the agent to fix it once.",
+                      file=sys.stderr)
+    return errors
+
+
+async def run(cfg: TargetConfig, config_path: Path, root: Path, run_id: str, *, label: str | None = None,
+              mpi: bool = False, limits: Limits = Limits(), goal: str | None = None) -> int:
+    r = Run(cfg=cfg, config_path=Path(config_path), root=Path(root).resolve(), run_id=run_id, mpi=mpi, label=label)
+    # Preflight is the only step before the agent: it is cheap and stops a run that cannot profile.
+    if run_script("preflight.sh", "--output", str(r.preflight), cwd=r.root):
+        print(f"error: preflight failed; see {r.preflight}", file=sys.stderr)
+        return FAILED
+    preflight = json.loads(r.preflight.read_text())
+    r.run_dir.mkdir(parents=True)
+    r.work.mkdir(parents=True, exist_ok=True)
+
+    transcript = Transcript(r.run_dir / "transcript.jsonl")
+    task = task_prompt(r, limits, preflight, goal)
+    transcript.write("start", run_id=run_id, target=cfg.target, mpi=mpi, limits=dataclasses.asdict(limits),
+                     tools=TOOLS, system_prompt=system_prompt(limits))
+    status = OK
+    try:
+        errors = await asyncio.wait_for(session(r, limits, task, transcript), timeout=limits.timeout_s)
+    except asyncio.TimeoutError:
+        print(f"error: wall-clock limit of {limits.timeout_s / 60:g} minutes reached; the agent was stopped",
+              file=sys.stderr)
+        transcript.write("timeout", seconds=limits.timeout_s)
+        errors, status = findings_errors(r.run_dir), TIMED_OUT
+
+    (r.run_dir / "report.md").unlink(missing_ok=True)  # the report is always generated, never the agent's
+    if errors:
+        print(f"error: {r.run_dir / 'findings.json'} is "
+              f"{'still invalid after one retry' if status == OK else 'missing or invalid'}:", file=sys.stderr)
+        for error in errors:
+            print(f"  - {error}", file=sys.stderr)
+        status = status or INVALID_FINDINGS
+    else:
+        print(write_report(r.run_dir).read_text())
+
+    if problems := source_changes(r.src, cfg.commit):
+        print("error: application source was modified:\n  " + "\n  ".join(problems), file=sys.stderr)
+        status = SOURCE_MODIFIED
+    transcript.write("end", status=status, findings_errors=errors, source_problems=problems)
+    transcript.close()
+    print(f"run directory: {r.run_dir} (transcript: transcript.jsonl)", file=sys.stderr)
     return status
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="bottleneck-agent", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
-    analyze = commands.add_parser("analyze", help="build a target and profile it with perf",
-                                  description="Run preflight checks, check out and build a target, "
-                                              "then let the agent profile it with perf.")
+    analyze = commands.add_parser("analyze", help="profile a target with perf and report its bottlenecks",
+                                  description="Run preflight checks, then let the agent build, profile and "
+                                              "analyze the target and write findings.json.")
     analyze.add_argument("--target", required=True, metavar="{" + ",".join(TARGETS) + "}",
                          help="proxy application to analyze")
     analyze.add_argument("--config", required=True, type=Path, metavar="PATH",
                          help="target config YAML, e.g. configs/lulesh.yaml")
     analyze.add_argument("--run-id", help="name of the run directory under runs/ (default: <target>-<timestamp>)")
-    analyze.add_argument("--label", help="free-form note stored in the run's metadata.json")
+    analyze.add_argument("--label", help="free-form note stored in the baseline's metadata.json")
     analyze.add_argument("--mpi", action="store_true",
                          help="build and profile the config's MPI variant with its default rank count")
-    analyze.add_argument("--model", help="Claude model to use (default: SDK default)")
-    analyze.add_argument("--max-turns", type=int, default=80)
     analyze.add_argument("--goal", help="extra focus for the analysis, e.g. 'memory behaviour'")
+    group = analyze.add_argument_group("limits")
+    group.add_argument("--model", help="Claude model (default: the SDK's default)")
+    group.add_argument("--max-turns", type=int, default=Limits.max_turns,
+                       help=f"agent turns for the analysis and for the retry (default {Limits.max_turns})")
+    group.add_argument("--timeout", default="60m", metavar="DURATION",
+                       help="wall-clock limit for the agent, e.g. 45m or 2h (default 60m)")
+    group.add_argument("--max-experiments", type=int, default=Limits.max_experiments,
+                       help=f"experiment runs the agent may make (default {Limits.max_experiments})")
     args = parser.parse_args(argv)
 
-    # Validate everything up front, before cloning, building or calling the API.
+    # Validate everything up front, before running anything or calling the API.
     if args.target not in TARGETS:
         analyze.error(f"invalid target {args.target!r} (choose from {', '.join(TARGETS)})")
     try:
         cfg = load_config(args.config, args.target)
     except ConfigError as e:
+        analyze.error(str(e))
+    try:
+        limits = Limits(model=args.model, max_turns=args.max_turns, timeout_s=parse_duration(args.timeout),
+                        max_experiments=args.max_experiments)
+    except ValueError as e:
         analyze.error(str(e))
     if args.mpi and cfg.mpi is None:
         analyze.error(f"--mpi needs an mpi section in {args.config}")
@@ -268,7 +349,7 @@ def main(argv: list[str] | None = None) -> int:
     if (Path.cwd() / "runs" / run_id).exists():
         analyze.error(f"runs/{run_id} already exists; choose another --run-id")
     return asyncio.run(run(cfg, args.config, Path.cwd(), run_id, label=args.label, mpi=args.mpi,
-                           model=args.model, max_turns=args.max_turns, goal=args.goal))
+                           limits=limits, goal=args.goal))
 
 
 if __name__ == "__main__":

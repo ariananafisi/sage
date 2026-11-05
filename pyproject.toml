@@ -20,4 +20,4 @@ bottleneck-agent = "sage.agent:main"
 packages = ["sage"]
 
 [tool.setuptools.package-data]
-sage = ["findings.schema.json"]
+sage = ["findings.schema.json", "prompts/*.md"]
