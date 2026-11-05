@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "run_id": "fixture-run",
+  "target": "lulesh",
+  "status": "inconclusive",
+  "summary": "The run finished in 0.04 s, too short to collect enough samples, and only software events were available. No bottleneck could be established.",
+  "findings": [],
+  "limitations": ["Only 12 samples were collected."]
+}

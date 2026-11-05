@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "run_id": "fixture-run",
+  "target": "comd",
+  "status": "bottlenecks_found",
+  "summary": "The Lennard-Jones force kernel takes 92% of samples. Its inner loop is scalar and dominated by the pair-distance cutoff test, so it is compute-bound on scalar floating point. Redistribution and link-cell sorting are a distant second.",
+  "findings": [
+    {
+      "rank": 1,
+      "function": "ljForce",
+      "source_location": "src-mpi/ljForce.c:139-188",
+      "sample_percent": 91.75,
+      "bottleneck_type": "poor_vectorization",
+      "supporting_evidence": [
+        "91.75% of 83K task-clock samples are in ljForce (perf-report.txt).",
+        "The annotated inner loop uses only scalar SSE instructions (vmulsd/vaddsd), with no packed FP (annotate/ljForce.txt).",
+        "Time per atom stays flat from 4K to 864K atoms (1.14 to 1.31 us/atom/task), so the loop is not cache-bound."
+      ],
+      "likely_cause": "Data-dependent continue statements for the cutoff and box-boundary checks, and possible aliasing of the force arrays, stop GCC from vectorizing the j-loop.",
+      "experiment": "Profiled lattice sizes 10, 20 and 40 with scripts/profile_target.sh --cmd to test cache sensitivity.",
+      "experiment_result": "Per-atom cost changed by less than 15% across a 200x change in footprint, which rules out a memory-bound loop and supports the compute-bound diagnosis.",
+      "confidence": "high",
+      "artifact_paths": [
+        "../../etc/passwd"
+      ]
+    },
+    {
+      "rank": 2,
+      "function": "sortAtomsInCell",
+      "source_location": "src-mpi/linkCells.c:270-290",
+      "sample_percent": 1.21,
+      "bottleneck_type": "other",
+      "supporting_evidence": [
+        "1.21% self time, plus msort_with_tmp in libc, called from redistributeAtoms every step (perf-report.txt)."
+      ],
+      "likely_cause": "Halo cells are re-sorted with qsort on every step, although atoms move little between steps.",
+      "experiment": "None beyond the baseline; the cost is small enough that the source and call graph settle it.",
+      "experiment_result": "Not tested separately; the estimate comes from the baseline profile only.",
+      "confidence": "medium",
+      "artifact_paths": [
+        "perf-report.txt"
+      ]
+    }
+  ],
+  "limitations": [
+    "No hardware PMU events in this VM: IPC, cache and branch misses could not be measured.",
+    "Only the serial build with the Lennard-Jones potential was profiled."
+  ]
+}

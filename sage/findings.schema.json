@@ -1,0 +1,67 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/ariananafisi/sage/sage/findings.schema.json",
+  "title": "SAGE findings",
+  "description": "The agent's final result for one run, written to runs/<run-id>/findings.json. report.md is generated from it. Beyond this schema, sage.findings checks that ranks are 1..n, that run_id names the run directory, and that every artifact path exists inside that directory.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "run_id", "target", "status", "summary", "findings"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "run_id": {"type": "string", "minLength": 1, "description": "Name of the run directory this result belongs to."},
+    "target": {"enum": ["lulesh", "comd"]},
+    "status": {
+      "enum": ["bottlenecks_found", "inconclusive"],
+      "description": "bottlenecks_found needs at least one finding. inconclusive may have none, or only tentative ones."
+    },
+    "summary": {"type": "string", "minLength": 1, "description": "A few sentences: what limits performance, or why the analysis was inconclusive."},
+    "findings": {"type": "array", "items": {"$ref": "#/definitions/finding"}},
+    "limitations": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "description": "What could not be measured or checked (e.g. no hardware counters)."
+    }
+  },
+  "if": {"properties": {"status": {"const": "bottlenecks_found"}}},
+  "then": {"properties": {"findings": {"minItems": 1}}},
+  "definitions": {
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rank", "function", "source_location", "sample_percent", "bottleneck_type",
+        "supporting_evidence", "likely_cause", "experiment", "experiment_result",
+        "confidence", "artifact_paths"
+      ],
+      "properties": {
+        "rank": {"type": "integer", "minimum": 1, "description": "Priority order: 1 is the most important finding. Ranks must be 1..n with no gaps or repeats."},
+        "function": {"type": "string", "minLength": 1, "description": "Symbol as perf reports it, e.g. ljForce."},
+        "source_location": {
+          "type": "string",
+          "pattern": "^[^\\s:][^:]*:[1-9][0-9]*(-[1-9][0-9]*)?$",
+          "description": "path:line or path:first-last, relative to the source checkout, e.g. src-mpi/ljForce.c:139-188."
+        },
+        "sample_percent": {"type": "number", "minimum": 0, "maximum": 100, "description": "Self time share from perf-report.txt."},
+        "bottleneck_type": {
+          "enum": [
+            "compute_bound", "memory_bandwidth_bound", "memory_latency_bound", "branch_misprediction",
+            "poor_vectorization", "serial_section", "load_imbalance", "mpi_communication",
+            "synchronization", "kernel_or_system", "other"
+          ]
+        },
+        "supporting_evidence": {
+          "type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1},
+          "description": "Concrete observations, each citing measured numbers."
+        },
+        "likely_cause": {"type": "string", "minLength": 1},
+        "experiment": {"type": "string", "minLength": 1, "description": "What was run to test the hypothesis (command or change of input)."},
+        "experiment_result": {"type": "string", "minLength": 1, "description": "What it showed, and whether it confirmed the hypothesis."},
+        "confidence": {"enum": ["high", "medium", "low"]},
+        "artifact_paths": {
+          "type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1},
+          "description": "Files or directories in the run directory that hold the evidence, relative to it (e.g. perf-report.txt, annotate/ljForce.txt, experiments/size-40/perf-stat.txt)."
+        }
+      }
+    }
+  }
+}

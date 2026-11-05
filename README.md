@@ -14,7 +14,9 @@ For a given target, SAGE:
    self-time report, plus metadata (`scripts/profile_target.sh`),
 4. hands the artifacts and the preflight results to the agent. The agent annotates the hot symbols
    (`scripts/annotate_symbol.sh`), runs further perf experiments, reads the hot source code, and
-   writes a Markdown report.
+   writes its result as `findings.json`,
+5. validates `findings.json` against a JSON schema, checks that every cited artifact exists in the
+   run directory, and generates `report.md` from it (`python -m sage.findings`).
 
 Each step is also a standalone script you can run yourself.
 
@@ -246,7 +248,68 @@ Options:
 
 The agent works in `runs/<run-id>/`. It starts from the baseline artifact set, saves
 annotations there, and puts further artifact sets under `runs/<run-id>/experiments/`.
-The report is saved as `runs/<run-id>/report.md`.
+Its result is `runs/<run-id>/findings.json`, and SAGE generates `runs/<run-id>/report.md` from it.
+
+## Findings and report
+
+The agent's final result is `findings.json` in the run directory. It is defined by the JSON schema
+in [`sage/findings.schema.json`](sage/findings.schema.json) (draft-07). The agent writes the file
+through the shell. It has no file-writing tool, and SAGE adds none. The agent then runs the
+validator itself and fixes any problems.
+
+| Field | Meaning |
+| --- | --- |
+| `schema_version` | `1` |
+| `run_id`, `target` | the run directory's name and `lulesh` or `comd` |
+| `status` | `bottlenecks_found` (needs at least one finding) or `inconclusive` (findings may be empty) |
+| `summary` | a few sentences on what limits performance, or why it is unclear |
+| `findings` | the findings, see below |
+| `limitations` | optional: what could not be measured or checked |
+
+Every finding has all of these fields:
+
+| Field | Meaning |
+| --- | --- |
+| `rank` | priority: 1 is the most important; ranks must be 1..n with no gaps or repeats |
+| `function` | symbol as perf reports it |
+| `source_location` | `path:line` or `path:first-last` in the checkout |
+| `sample_percent` | self-time share, 0–100 |
+| `bottleneck_type` | `compute_bound`, `memory_bandwidth_bound`, `memory_latency_bound`, `branch_misprediction`, `poor_vectorization`, `serial_section`, `load_imbalance`, `mpi_communication`, `synchronization`, `kernel_or_system` or `other` |
+| `supporting_evidence` | at least one observation, with measured numbers |
+| `likely_cause` | the explanation |
+| `experiment`, `experiment_result` | what was run to test it, and what it showed |
+| `confidence` | `high`, `medium` or `low` |
+| `artifact_paths` | at least one file or directory holding the evidence, relative to the run directory |
+
+The validator checks the schema, then:
+
+- `run_id` must match the run directory's name.
+- Ranks must be 1..n with no gaps or repeats.
+- Every artifact path must exist inside the run directory. Paths that escape it, including through
+  `..` or a symlink, are rejected.
+- `findings.json` and `report.md` themselves cannot be cited as evidence.
+
+A finding without artifact evidence is invalid. All problems are reported at once, with their
+location (for example `findings[1].artifact_paths[0]: ...`).
+
+```bash
+python -m sage.findings validate runs/comd-baseline
+```
+
+```bash
+python -m sage.findings render runs/comd-baseline
+```
+
+`render` validates first, then writes `report.md`. The report contains:
+
+- the status and summary
+- run details from `metadata.json`: command, build, wall-clock, host, unavailable perf events
+- a findings table ordered by rank
+- one section per finding: evidence, likely cause, experiment and result, and links to its artifacts
+- the limitations
+
+`analyze` deletes any `report.md` the agent wrote. If `findings.json` is missing or invalid, it
+prints the problems, writes no report, and exits 4.
 
 ## Layout
 
@@ -259,7 +322,8 @@ configs/lulesh.yaml, configs/comd.yaml   target configs
 .work/<target>/build-mpi.log, build-info-mpi.json   the same for the MPI variant
 .work/<target>/...                       build outputs (e.g. .work/lulesh/build/, build-mpi/)
 runs/<run-id>/                           one artifact set (see above); for analyze also the agent's
-                                         working directory, with annotate/, experiments/, report.md
+                                         working directory, with annotate/, experiments/,
+                                         findings.json (agent result) and report.md (generated)
 ```
 
 `.work/` and `runs/` are git-ignored. A later run reuses the checkout and rebuilds incrementally.
@@ -319,6 +383,7 @@ Code: `scripts/preflight.sh` and `scripts/build_target.sh` (machine checks, chec
 `scripts/profile_target.sh` and `scripts/annotate_symbol.sh` (perf artifact sets),
 `sage/config.py` (config loading and validation, also used by the scripts),
 `sage/artifacts.py` (perf stat and report parsers and the `metadata.json` writer),
+`sage/findings.py` and `sage/findings.schema.json` (the result format, its validator and the report generator),
 `sage/agent.py` (the agent and the CLI), `sage/guard.py` (the safety rails).
 
 ## Exit codes
@@ -329,6 +394,7 @@ Code: `scripts/preflight.sh` and `scripts/build_target.sh` (machine checks, chec
 | 1 | preflight failed (no usable perf, compiler or events), checkout or build failed, baseline profiling failed, or the agent run failed |
 | 2 | invalid command line, target or config |
 | 3 | application source was modified |
+| 4 | the agent's `findings.json` is missing or invalid; no report was written |
 
 ## Tests
 
@@ -337,6 +403,9 @@ network. The SDK's `query()` is replaced with a fake. perf, `mpirun` and the com
 replaced with small fake executables, which simulate machines with full hardware counters, with
 software events only, or with a broken perf, and can make any perf step fail. A local git
 repository stands in for the upstream.
+
+The findings validator is tested against valid and invalid `findings.json` files in
+`tests/fixtures/findings/`, and against many single-field changes to them.
 
 The parsers are tested against saved perf output in `tests/fixtures/`. The software-only
 `perf stat`, the report and the annotate output are real output from a VM. The hardware-counter

@@ -24,6 +24,7 @@ from claude_agent_sdk import (
 )
 
 from .config import TARGETS, ConfigError, TargetConfig, load_config
+from .findings import SCHEMA_PATH, FindingsError, write_report
 from .guard import changed, make_guard, snapshot
 
 TOOLS = ["Bash", "Read", "Glob", "Grep"]
@@ -60,14 +61,20 @@ Method:
    serial sections, MPI communication, etc.), citing the perf evidence. For MPI
    runs, compare ranks and time spent in MPI libraries.
 
-Finish with a Markdown report and nothing else, containing:
-## Environment
-## Build and run (exact commands)
-## Baseline metrics (perf stat table)
-## Hotspots (table: function, file:line, % of samples)
-## Bottleneck analysis (one subsection per hotspot: evidence -> diagnosis)
-## Optimization opportunities (suggestions only; nothing was changed)
-## Limitations
+Result: finish by writing findings.json in the run directory (e.g. with
+`cat > findings.json <<'EOF' ... EOF`), following the JSON schema whose path is in
+the task. report.md is generated from it; do not write report.md yourself.
+- status "bottlenecks_found" needs at least one finding; use "inconclusive" when
+  the evidence does not establish a bottleneck (findings may then be empty).
+- Rank findings 1..n by importance. Every finding needs supporting_evidence with
+  measured numbers, an experiment and its result (say plainly if no extra
+  experiment was run), and artifact_paths: files in the run directory, relative
+  to it, that hold the evidence (perf-report.txt, annotate/<symbol>.txt,
+  experiments/<name>/..., your own perf output files).
+- Put optimization ideas in likely_cause or experiment_result; list what could
+  not be measured in limitations.
+- Run the validate command from the task and fix every reported problem until it
+  passes. Then reply with one line saying findings.json is complete.
 """
 
 APP_HINTS = {
@@ -136,6 +143,9 @@ def build_prompt(cfg: TargetConfig, work: Path, run_dir: Path, config_path: Path
         f"  new artifact set:   {scripts}/profile_target.sh {cfg.target} <name> --runs {run_dir}/experiments "
         f"--work {work.parent} --config {Path(config_path).resolve()}"
         + (f" --ranks {mpi['ranks']}" if mpi else "") + " [--label TEXT] [--cmd '{binary} <args>']",
+        f"  validate findings:  {sys.executable} -m sage.findings validate {run_dir}",
+        "",
+        f"findings.json schema: {SCHEMA_PATH}",
     ]
     if goal:
         lines += ["", f"Additional focus: {goal}"]
@@ -189,7 +199,7 @@ async def run(cfg: TargetConfig, config_path: Path, root: Path, run_id: str, *, 
     options = build_options(cfg, work, run_dir, set(source), model, max_turns, mpi)
     prompt = build_prompt(cfg, work, run_dir, config_path, metadata, preflight, goal)
 
-    report, status = None, 0
+    status = 0
     try:
         async for message in query(prompt=prompt, options=options):
             if isinstance(message, AssistantMessage):
@@ -199,17 +209,22 @@ async def run(cfg: TargetConfig, config_path: Path, root: Path, run_id: str, *, 
                     elif isinstance(block, ToolUseBlock):
                         detail = block.input.get("command") or block.input.get("file_path") or block.input.get("pattern", "")
                         print(f"[{block.name}] {detail}", file=sys.stderr)
-            elif isinstance(message, ResultMessage):
-                report = message.result
-                if message.is_error:
-                    status = 1
+            elif isinstance(message, ResultMessage) and message.is_error:
+                status = 1
     except ResultError as e:
         print(f"error: agent run failed ({e.terminal_reason or e.subtype}): {e}", file=sys.stderr)
         status = 1
 
-    if report:
-        (run_dir / "report.md").write_text(report)
-        print(report)
+    # The agent's result is findings.json; report.md is generated from it, never written by the agent.
+    (run_dir / "report.md").unlink(missing_ok=True)
+    try:
+        report = write_report(run_dir)
+        print(report.read_text())
+    except FindingsError as e:
+        print(f"error: {run_dir / 'findings.json'} is missing or invalid:", file=sys.stderr)
+        for error in e.errors:
+            print(f"  - {error}", file=sys.stderr)
+        status = status or 4
     print(f"run directory: {run_dir}", file=sys.stderr)
 
     violations = changed(source)

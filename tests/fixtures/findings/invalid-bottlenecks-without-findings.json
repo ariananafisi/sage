@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "run_id": "fixture-run",
+  "target": "comd",
+  "status": "bottlenecks_found",
+  "summary": "The Lennard-Jones force kernel takes 92% of samples. Its inner loop is scalar and dominated by the pair-distance cutoff test, so it is compute-bound on scalar floating point. Redistribution and link-cell sorting are a distant second.",
+  "findings": [],
+  "limitations": [
+    "No hardware PMU events in this VM: IPC, cache and branch misses could not be measured.",
+    "Only the serial build with the Lennard-Jones potential was profiled."
+  ]
+}

@@ -73,16 +73,32 @@ def scripts(monkeypatch):
     return calls, codes
 
 
-def fake_query(calls, side_effect=None):
+def findings_for(options, status="bottlenecks_found"):
+    """What a well-behaved agent writes: a valid findings.json citing the baseline's perf-report.txt."""
+    run_dir = Path(options.cwd)
+    finding = {"rank": 1, "function": "ljForce", "source_location": "src-mpi/ljForce.c:139-188",
+               "sample_percent": 85.04, "bottleneck_type": "compute_bound",
+               "supporting_evidence": ["85% of samples in ljForce"], "likely_cause": "scalar inner loop",
+               "experiment": "size scan", "experiment_result": "flat per-atom cost", "confidence": "high",
+               "artifact_paths": ["perf-report.txt" if (run_dir / "perf-report.txt").exists() else "rank-0/perf-report.txt"]}
+    return {"schema_version": 1, "run_id": run_dir.name, "target": "lulesh", "status": status,
+            "summary": "ljForce dominates.", "findings": [finding] if status == "bottlenecks_found" else []}
+
+
+def fake_query(calls, side_effect=None, findings=findings_for):
     async def query(*, prompt, options):
         calls.append((prompt, options))
         if side_effect:
             side_effect()
+        data = findings(options) if findings else None
+        if data is not None:
+            (Path(options.cwd) / "findings.json").write_text(data if isinstance(data, str) else json.dumps(data))
+        (Path(options.cwd) / "report.md").write_text("agent-written report, must be replaced")
         yield AssistantMessage(content=[TextBlock(text="checking perf"),
                                         ToolUseBlock(id="t1", name="Bash", input={"command": "perf --version"})],
                                model="test")
         yield ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
-                            num_turns=2, session_id="s", result="## Hotspots\nCalcFBHourglassForceForElems 30%")
+                            num_turns=2, session_id="s", result="findings.json is complete")
     return query
 
 
@@ -117,7 +133,9 @@ def test_run_preflight_build_profile_then_agent(cfg, tmp_path, scripts, monkeypa
     assert script_calls[1][1] == ("lulesh", "--config", str(config), "--work", str(root / ".work"))
     assert script_calls[2][1] == ("lulesh", "r1", "--config", str(config), "--work", str(root / ".work"),
                                   "--runs", str(root / "runs"), "--label", "base")
-    assert "Hotspots" in (run_dir / "report.md").read_text()
+    report = (run_dir / "report.md").read_text()
+    assert report.startswith("# LULESH performance bottlenecks: run r1") and "agent-written" not in report
+    assert "| 1 | `ljForce` |" in report and "## Run" in report
 
     [(prompt, options)] = calls
     assert options.cwd == str(run_dir)
@@ -133,7 +151,8 @@ def test_run_preflight_build_profile_then_agent(cfg, tmp_path, scripts, monkeypa
     assert "cycles=no" in prompt and "warning: only software events are available" in prompt
     assert "memory" in prompt
     out = capsys.readouterr()
-    assert "Hotspots" in out.out and "[Bash] perf --version" in out.err
+    assert "**Status:** Bottlenecks found" in out.out and "[Bash] perf --version" in out.err
+    assert f"{agent.SCHEMA_PATH}" in prompt and f"-m sage.findings validate {run_dir}" in prompt
 
 
 def test_run_mpi_builds_and_profiles_mpi_variant(cfg, tmp_path, scripts, monkeypatch):
@@ -248,3 +267,35 @@ def test_cli_config_errors(captured_run, tmp_path, capsys):
 def test_cli_requires_arguments(capsys):
     assert "required" in cli_error([], capsys)
     assert "--config" in cli_error(["analyze", "--target", "lulesh"], capsys)
+
+
+@pytest.mark.parametrize("findings,message", [
+    (None, "findings.json not found"),
+    ("{broken", "is not valid JSON"),
+    (lambda o: {**findings_for(o), "findings": []}, "status is bottlenecks_found but there are no findings"),
+    (lambda o: {**findings_for(o), "findings": [{**findings_for(o)["findings"][0], "artifact_paths": ["nope.txt"]}]},
+     "'nope.txt' does not exist in the run directory"),
+])
+def test_run_fails_without_valid_findings(cfg, tmp_path, scripts, monkeypatch, capsys, findings, message):
+    produce = findings if callable(findings) else (lambda o: findings)
+    monkeypatch.setattr(agent, "query", fake_query([], findings=produce if findings is not None else None))
+    assert asyncio.run(agent.run(cfg, Path("cfg.yaml"), tmp_path, "r1")) == 4
+    err = capsys.readouterr().err
+    assert "findings.json is missing or invalid" in err and message in err
+    assert not (tmp_path / "runs/r1/report.md").exists()  # the agent's own report.md was discarded
+
+
+def test_inconclusive_run_succeeds(cfg, tmp_path, scripts, monkeypatch, capsys):
+    monkeypatch.setattr(agent, "query", fake_query([], findings=lambda o: findings_for(o, "inconclusive")))
+    assert asyncio.run(agent.run(cfg, Path("cfg.yaml"), tmp_path, "r1")) == 0
+    assert "**Status:** Inconclusive" in (tmp_path / "runs/r1/report.md").read_text()
+
+
+def test_source_modification_outranks_invalid_findings(cfg, tmp_path, scripts, monkeypatch):
+    tamper = lambda: (tmp_path / ".work/lulesh/src/main.c").write_text("// optimized\n")
+    monkeypatch.setattr(agent, "query", fake_query([], tamper, findings=None))
+    assert asyncio.run(agent.run(cfg, Path("cfg.yaml"), tmp_path, "r1")) == 3
+
+
+def test_system_prompt_asks_for_findings_json():
+    assert "findings.json" in agent.SYSTEM_PROMPT and "do not write report.md yourself" in agent.SYSTEM_PROMPT
