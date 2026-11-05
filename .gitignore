@@ -1,0 +1,5 @@
+__pycache__/
+*.egg-info/
+.venv/
+sage-runs/
+.pytest_cache/
