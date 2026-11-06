@@ -296,3 +296,29 @@ def test_annotate_errors(env, tmp_path):
     assert r.returncode == 1 and "perf annotate failed (exit 3)" in r.stderr
     custom = tmp_path / "out" / "lj.txt"
     assert annotate(env, "base", "ljForce", "--output", str(custom)).returncode == 0 and custom.is_file()
+
+
+def test_env_override_is_applied_and_recorded(env):
+    r = profile(env, "threads-1", "--env", "OMP_NUM_THREADS=1", "--env", "EXTRA=a b")
+    assert r.returncode == 0, r.stderr
+    assert "threads=1 " in (env["runs"] / "threads-1" / "stdout.log").read_text()  # the app really ran with it
+    meta = metadata(env, "threads-1")
+    assert meta["threads"]["variables"]["OMP_NUM_THREADS"] == "1"  # not the config's 3
+    assert meta["env_overrides"] == {"OMP_NUM_THREADS": "1", "EXTRA": "a b"}
+    assert metadata(env, "threads-1")["environment"]["EXTRA"] == "a b"
+    assert profile(env, "plain").returncode == 0 and metadata(env, "plain")["env_overrides"] == {}
+
+
+@pytest.mark.parametrize("cmd", ["env OMP_NUM_THREADS=1 {binary}", "OMP_NUM_THREADS=1 {binary} -N 5", "  env -i {binary}"])
+def test_cmd_may_not_set_environment(env, cmd):
+    r = profile(env, "sneaky", "--cmd", cmd)
+    assert r.returncode == 2 and "use --env NAME=VALUE instead" in r.stderr
+    assert not (env["runs"] / "sneaky").exists()
+
+
+@pytest.mark.parametrize("value,message", [("OMP_NUM_THREADS", "--env needs NAME=VALUE"),
+                                           ("1X=2", "--env needs NAME=VALUE"),
+                                           ("SAGE_FLAGS=-O0", "may not set SAGE_ variables")])
+def test_bad_env_override(env, value, message):
+    r = profile(env, "bad", "--env", value)
+    assert r.returncode == 2 and message in r.stderr

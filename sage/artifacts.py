@@ -170,6 +170,7 @@ def build_metadata(run_dir: Path, fields: dict, env: dict) -> dict:
         "started_at": fields.get("started_at"), "finished_at": fields.get("finished_at"),
         "command_line": fields.get("command_line"),
         "run_command": fields.get("run_command"),
+        "env_overrides": dict(kv.split("=", 1) for kv in (fields.get("env_overrides") or "").splitlines() if "=" in kv),
         "mpi": {"ranks": ranks, "launcher": fields.get("launcher")} if ranks else None,
         "wall_clock": {
             "total_s": secs("total_ns"), "perf_stat_s": secs("stat_ns"), "perf_record_s": secs("record_ns"),

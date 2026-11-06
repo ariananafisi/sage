@@ -88,7 +88,8 @@ def test_task_prompt_is_complete(tmp_path, cfg, mpi, goal):
     run_dir = tmp_path / "runs" / "r1"
     assert f"Run directory (your working directory): {run_dir}" in text
     assert f"profile_target.sh lulesh baseline --runs {run_dir} --work {tmp_path / '.work'}" in text
-    assert f"--runs {run_dir / 'experiments'}" in text and "--cmd '{binary} <arguments>'" in text
+    assert f"--runs {run_dir / 'experiments'}" in text and "[--cmd '{binary} <arguments>'] [--env NAME=VALUE]" in text
+    assert "environment variables with --env NAME=VALUE" in text
     assert f"annotate_symbol.sh baseline <symbol>{' --rank <r>' if mpi else ''} --runs {run_dir}" in text
     assert f"-m sage.findings validate {run_dir}" in text
     assert "--label 'first try'" in text

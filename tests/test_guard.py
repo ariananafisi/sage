@@ -102,6 +102,8 @@ def policy(tmp_path):
     "/repo/scripts/profile_target.sh lulesh size-60 --runs {run}/experiments --cmd '{{binary}} -s 60'",
     "cd {run} && /repo/scripts/profile_target.sh lulesh threads-1 --runs experiments --cmd '{{binary}}'",
     "/repo/scripts/annotate_symbol.sh baseline ljForce --runs {run}",
+    "/repo/scripts/profile_target.sh lulesh threads-1 --runs $PWD/experiments --env OMP_NUM_THREADS=1",
+    "/repo/scripts/profile_target.sh lulesh threads-1 --env OMP_NUM_THREADS=1 --runs ${{PWD}}/experiments",
 ])
 def test_allowed_executions(policy, cmd):
     command = cmd.format(run=policy.run_dir)

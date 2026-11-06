@@ -245,7 +245,7 @@ def check_execution(command: str, policy: Policy, cwd: str) -> str | None:
 def _check_profile(args: list[str], policy: Policy, cwd: str) -> str | None:
     positional, runs, i = [], "runs", 0
     while i < len(args):
-        if args[i] in ("--label", "--cmd", "--ranks", "--config", "--work", "--runs"):
+        if args[i] in ("--label", "--cmd", "--env", "--ranks", "--config", "--work", "--runs"):
             if args[i] == "--runs" and i + 1 < len(args):
                 runs = args[i + 1]
             i += 2
@@ -253,6 +253,7 @@ def _check_profile(args: list[str], policy: Policy, cwd: str) -> str | None:
             positional.append(args[i])
             i += 1
     run_id = positional[1] if len(positional) > 1 else ""
+    runs = runs.replace("${PWD}", cwd).replace("$PWD", cwd)  # not expanded by the tokenizer
     runs_dir = Path(os.path.normpath(os.path.join(cwd, runs)))
     if runs_dir == policy.run_dir and run_id == "baseline":
         return None

@@ -181,7 +181,11 @@ The target must already be built. `profile_target.sh <target> <run-id>` creates
 Options:
 
 - `--label TEXT`: a note stored in the metadata.
-- `--cmd COMMAND`: replaces the config's run command; `{binary}` expands to the binary.
+- `--cmd COMMAND`: replaces the config's run command; `{binary}` expands to the binary. It may not
+  set environment variables (`env X=1 ...` or `X=1 ...`), because those would not be recorded.
+- `--env NAME=VALUE` (repeatable): sets an environment variable for the application, overriding
+  the config's `env`, e.g. `--env OMP_NUM_THREADS=1`. The run uses it, and `metadata.json` records
+  it, both in its environment and thread settings and as `env_overrides`.
 - `--ranks N`: an MPI run.
 - `--runs DIR`: where the run directory goes.
 - `--config`, `--work`: as for `build_target.sh`.

@@ -13,10 +13,13 @@
 # Exit status: 0 = all artifacts written, 1 = a step failed (metadata.json says which),
 # 2 = bad arguments or config.
 #
-# usage: scripts/profile_target.sh <target> <run-id> [--label TEXT] [--cmd COMMAND] [--ranks N]
+# usage: scripts/profile_target.sh <target> <run-id> [--label TEXT] [--cmd COMMAND] [--env NAME=VALUE]... [--ranks N]
 #                                  [--config PATH] [--work DIR] [--runs DIR]
 #   --label TEXT   free-form note stored in metadata.json
-#   --cmd COMMAND  run COMMAND instead of the config's run command; {binary} expands to the binary
+#   --cmd COMMAND  run COMMAND instead of the config's run command; {binary} expands to the binary.
+#                  It may not set environment variables itself; use --env so they are recorded
+#   --env NAME=VALUE  set an environment variable for the application (repeatable), e.g.
+#                  OMP_NUM_THREADS=1; it overrides the config's env and is recorded in metadata.json
 #   --ranks N      MPI run with N ranks (needs --cmd unless N is the config's mpi.ranks)
 #   --config PATH  target config (default: configs/<target>.yaml in this repository)
 #   --work DIR     checkouts and builds (default: .work)
@@ -24,18 +27,19 @@
 set -uo pipefail
 
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-usage() { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; }
 bad() { echo "profile_target: $*" >&2; exit 2; }
 die() { echo "profile_target: $*" >&2; exit 1; }
 q() { printf '%q' "$1"; }
 now() { date +%s%N; }  # nanoseconds
 
-target="" run_id="" label="" cmd="" ranks="" config="" work_root=.work runs=runs
+target="" run_id="" label="" cmd="" ranks="" config="" work_root=.work runs=runs overrides=()
 command_line=$(printf '%q ' "$0" "$@"); command_line=${command_line% }
 while [[ $# -gt 0 ]]; do
   case $1 in
     --label) label=${2?--label needs text}; shift 2 ;;
     --cmd) cmd=${2:?--cmd needs a command}; shift 2 ;;
+    --env) overrides+=("${2:?--env needs NAME=VALUE}"); shift 2 ;;
     --ranks) ranks=${2:?--ranks needs a number}; shift 2 ;;
     --config) config=${2:?--config needs a path}; shift 2 ;;
     --work) work_root=${2:?--work needs a directory}; shift 2 ;;
@@ -55,6 +59,16 @@ PYTHON=${PYTHON:-python3}
 export PYTHONPATH="$repo${PYTHONPATH:+:$PYTHONPATH}"
 vars=$("$PYTHON" -m sage.config "$config" "$target" ${ranks:+--mpi}) || exit 2
 eval "$vars"
+# Environment overrides: applied after the config's env, so the application really runs with them,
+# and metadata.json (which records the environment the runs inherit) shows the values used.
+for kv in "${overrides[@]}"; do
+  [[ $kv =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || bad "--env needs NAME=VALUE (got '$kv')"
+  [[ ${BASH_REMATCH[1]} != SAGE_* ]] || bad "--env may not set SAGE_ variables"
+  export "${BASH_REMATCH[1]}=${BASH_REMATCH[2]}"
+done
+if [[ $cmd =~ ^[[:space:]]*(env[[:space:]]|[A-Za-z_][A-Za-z0-9_]*=) ]]; then
+  bad "--cmd may not set environment variables (they would not be recorded); use --env NAME=VALUE instead"
+fi
 if [[ -n $ranks && $ranks != "$SAGE_RANKS" && -z $cmd ]]; then
   bad "the config's MPI run command is written for $SAGE_RANKS ranks; pass --cmd for $ranks ranks"
 fi
@@ -88,6 +102,7 @@ meta() {  # meta <status> [error]
     --set "status=$1" --set "error=${2:-}" --set "started_at=$started_at" \
     --set "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" --set "command_line=$command_line" \
     --set "run_command=$run_cmd" --set "launcher=$launcher" --set "ranks=$ranks" \
+    --set "env_overrides=$(IFS=$'\n'; echo "${overrides[*]}")" \
     --set "stat_command=$stat_cmd" --set "record_command=$record_cmd" --set "report_command=$report_cmd" \
     --set "perf_version=$perf_version" --set "build_info=$build_info" \
     --set "stat_ns=$stat_ns" --set "record_ns=$record_ns" --set "total_ns=$(( $(now) - t0 ))"

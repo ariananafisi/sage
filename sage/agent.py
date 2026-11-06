@@ -126,7 +126,7 @@ class Run:
             "annotate_command": f"{SCRIPTS}/annotate_symbol.sh baseline <symbol>{rank} --runs {self.run_dir}",
             "experiment_command": f"{profile} <name> --runs {self.run_dir / 'experiments'} --work {work} "
                                   f"--config {config}{ranks} --label '<the one factor changed>' "
-                                  f"--cmd '{{binary}} <arguments>'",
+                                  f"[--cmd '{{binary}} <arguments>'] [--env NAME=VALUE]",
             "annotate_experiment_command": f"{SCRIPTS}/annotate_symbol.sh <name> <symbol>{rank} "
                                            f"--runs {self.run_dir / 'experiments'}",
             "validate_command": f"{sys.executable} -m sage.findings validate {self.run_dir}",
