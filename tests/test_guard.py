@@ -1,10 +1,9 @@
-import asyncio
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from sage.guard import Policy, check_command, check_execution, check_write, make_guard, source_changes, tracked
+from sage.guard import Policy, check_bash, check_command, check_execution, source_changes, tracked
 
 CWD = "/work"
 PROTECTED = {
@@ -150,50 +149,13 @@ def test_experiment_count_ignores_files(policy):
     assert policy.experiments_used() == 0
 
 
-# --- file-writing tools --------------------------------------------------------------------
+# --- check_bash: what the agent's shell tool uses -------------------------------------------
 
-@pytest.mark.parametrize("path,allowed", [
-    ("findings.json", True),
-    ("./findings.json", True),
-    ("{run}/findings.json", True),
-    ("report.md", False),
-    ("notes.txt", False),
-    ("experiments/findings.json", False),
-    ("../r2/findings.json", False),
-    ("/work/src/lulesh.cc", False),
-])
-def test_write_tools_limited_to_findings(policy, path, allowed):
-    reason = check_write({"file_path": path.format(run=policy.run_dir)}, policy, str(policy.run_dir))
-    assert (reason is None) == allowed
-
-
-def test_write_through_symlink_is_denied(policy, tmp_path):
-    (tmp_path / "elsewhere.json").write_text("{}")
-    (policy.run_dir / "findings.json").symlink_to(tmp_path / "elsewhere.json")
-    assert check_write({"file_path": "findings.json"}, policy, str(policy.run_dir)) is not None
-
-
-# --- the hook ------------------------------------------------------------------------------
-
-def run_hook(policy, tool_name, tool_input):
-    hook = make_guard(policy)
-    return asyncio.run(hook({"tool_name": tool_name, "tool_input": tool_input, "cwd": str(policy.run_dir)}, "id", None))
-
-
-def test_hook_allows_with_empty_output(policy):
-    assert run_hook(policy, "Bash", {"command": "perf report -i baseline/perf.data --stdio"}) == {}
-    assert run_hook(policy, "Read", {"file_path": "/work/src/lulesh.cc"}) == {}
-    assert run_hook(policy, "Write", {"file_path": "findings.json", "content": "{}"}) == {}
-    assert run_hook(policy, "Edit", {"file_path": "findings.json", "old_string": "a", "new_string": "b"}) == {}
-
-
-def test_hook_denies_in_sdk_format(policy):
-    out = run_hook(policy, "Bash", {"command": "perf stat ls"})["hookSpecificOutput"]
-    assert out["hookEventName"] == "PreToolUse" and out["permissionDecision"] == "deny"
-    assert "profile_target.sh" in out["permissionDecisionReason"]
-    for tool, data in [("Write", {"file_path": "report.md"}), ("NotebookEdit", {"notebook_path": "findings.json"}),
-                       ("MultiEdit", {"file_path": "findings.json"})]:
-        assert run_hook(policy, tool, data)["hookSpecificOutput"]["permissionDecision"] == "deny"
+def test_check_bash_combines_both_checks(policy):
+    cwd = str(policy.run_dir)
+    assert check_bash("perf report -i baseline/perf.data --stdio", policy, cwd) is None
+    assert "'perf stat' runs the application" in check_bash("perf stat ls", policy, cwd)
+    assert "perf is the only" in check_bash("valgrind ls", policy, cwd)
 
 
 def git(*args, cwd):
@@ -213,11 +175,11 @@ def checkout(tmp_path):
     return src, git("rev-parse", "HEAD", cwd=src)
 
 
-def test_hook_protects_checkout_created_mid_run(policy, checkout):
+def test_checkout_created_mid_run_is_protected(policy, checkout):
     src, _ = checkout
     p = Policy(src=src, run_dir=policy.run_dir, binaries=policy.binaries, max_experiments=1)
     assert tracked(src) == {str(src.resolve() / "a.c"), str(src.resolve() / "sub" / "b.h")}
-    assert run_hook(p, "Bash", {"command": f"echo x > {src}/a.c"})["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "Source files are read-only" in check_bash(f"echo x > {src}/a.c", p, str(policy.run_dir))
     assert tracked(src.parent / "missing") == set()
 
 

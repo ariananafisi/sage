@@ -1,9 +1,12 @@
-"""bottleneck-agent: a single Claude agent that finds performance bottlenecks with Linux perf."""
+"""bottleneck-agent: a single LLM agent that finds performance bottlenecks with Linux perf.
+
+The model is served by HokieAI (Virginia Tech's Azure API Management gateway to OpenAI models),
+through the OpenAI Python SDK's Chat Completions API with function calling.
+"""
 
 from __future__ import annotations
 
 import argparse
-import asyncio
 import dataclasses
 import json
 import os
@@ -14,26 +17,22 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from claude_agent_sdk import (
-    AssistantMessage,
-    ClaudeAgentOptions,
-    ClaudeSDKClient,
-    HookMatcher,
-    ResultError,
-    ResultMessage,
-    TextBlock,
-    ToolUseBlock,
-)
+import openai
 
 from .config import TARGETS, ConfigError, TargetConfig, load_config
 from .findings import SCHEMA_PATH, FindingsError, load as load_findings, write_report
-from .guard import Policy, make_guard, source_changes
+from .guard import Policy, source_changes
+from .tools import SCHEMAS, DeadlineExceeded, Tools
 
-TOOLS = ["Bash", "Read", "Glob", "Grep", "Write", "Edit"]  # Write/Edit are limited to findings.json by the hook
 SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 PROMPTS = Path(__file__).resolve().parent / "prompts"
 RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")  # same rule as scripts/profile_target.sh
 PLACEHOLDER = re.compile(r"\{\{\s*(\w+)\s*\}\}")
+
+KEY_VAR = "HOKIEAI_API"  # the HokieAI subscription key, from the environment or .env
+BASE_URL_VAR = "HOKIEAI_BASE_URL"
+DEFAULT_BASE_URL = "https://apim-n1ai-usc-e1f7a372a.azure-api.net/openai/v1"
+DEFAULT_MODEL = "gpt-5"
 
 # Exit codes (also in the README).
 OK, FAILED, USAGE, SOURCE_MODIFIED, INVALID_FINDINGS, TIMED_OUT = 0, 1, 2, 3, 4, 5
@@ -56,13 +55,13 @@ def load_prompt(name: str, **values: object) -> str:
 
 @dataclass(frozen=True)
 class Limits:
-    model: str | None = None  # None: the SDK's default model
-    max_turns: int = 80  # per agent turn (the analysis, and the retry)
+    model: str = DEFAULT_MODEL
+    max_turns: int = 80  # model calls, for the analysis and again for the retry
     timeout_s: float = 3600  # wall-clock for the whole agent session, retry included
     max_experiments: int = 1  # experiment artifact sets under <run>/experiments
 
     def __post_init__(self):
-        if self.model is not None and not self.model.strip():
+        if not isinstance(self.model, str) or not self.model.strip():
             raise ValueError("model must not be empty")
         if isinstance(self.max_turns, bool) or not isinstance(self.max_turns, int) or self.max_turns < 1:
             raise ValueError(f"max turns must be a positive integer, got {self.max_turns!r}")
@@ -82,6 +81,39 @@ def parse_duration(text: str) -> float:
     if value <= 0:
         raise ValueError(f"duration must be positive, got {text!r}")
     return value
+
+
+def read_dotenv(path: Path) -> dict[str, str]:
+    """KEY=VALUE lines of a .env file (comments, blank lines and an `export ` prefix allowed)."""
+    values = {}
+    if not path.is_file():
+        return values
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        line = line.removeprefix("export ").strip()
+        key, sep, value = line.partition("=")
+        if sep and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key.strip()):
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+                value = value[1:-1]
+            values[key.strip()] = value
+    return values
+
+
+def hokieai_settings(root: Path) -> tuple[str | None, str]:
+    """The HokieAI key and base URL: the process environment wins over <root>/.env."""
+    dotenv = read_dotenv(root / ".env")
+    key = os.environ.get(KEY_VAR) or dotenv.get(KEY_VAR) or None
+    base_url = os.environ.get(BASE_URL_VAR) or dotenv.get(BASE_URL_VAR) or DEFAULT_BASE_URL
+    return key, base_url
+
+
+def make_client(key: str, base_url: str) -> openai.OpenAI:
+    # HokieAI authenticates with the APIM subscription key in the `api-key` header and ignores
+    # Authorization, so the SDK's required api_key gets a placeholder and the key is sent once.
+    return openai.OpenAI(base_url=base_url, api_key="hokieai", default_headers={"api-key": key}, max_retries=3)
 
 
 def run_script(name: str, *args: str, cwd: Path) -> int:
@@ -135,6 +167,11 @@ class Run:
     def env(self) -> dict[str, str]:
         return {**self.cfg.env, **(self.cfg.mpi.env if self.mpi else {}), "PYTHON": sys.executable}
 
+    def policy(self, limits: Limits) -> Policy:
+        binaries = [self.cfg.binary] + ([self.cfg.mpi.binary] if self.cfg.mpi else [])
+        return Policy(src=self.src, run_dir=self.run_dir, max_experiments=limits.max_experiments,
+                      binaries=frozenset(Path(b).name for b in binaries))
+
 
 def _quote(text: str) -> str:
     return "'" + text.replace("'", "'\\''") + "'"
@@ -170,27 +207,8 @@ def task_prompt(run: Run, limits: Limits, preflight: dict, goal: str | None) -> 
     )
 
 
-def build_options(run: Run, limits: Limits) -> ClaudeAgentOptions:
-    binaries = [run.cfg.binary] + ([run.cfg.mpi.binary] if run.cfg.mpi else [])
-    policy = Policy(src=run.src, run_dir=run.run_dir, max_experiments=limits.max_experiments,
-                    binaries=frozenset(Path(b).name for b in binaries))
-    return ClaudeAgentOptions(
-        tools=TOOLS,  # the agent's whole toolset: no subagents, no web, no MCP servers
-        allowed_tools=TOOLS,
-        permission_mode="dontAsk",  # anything not pre-approved is denied, never prompted
-        system_prompt=system_prompt(limits),
-        cwd=str(run.run_dir),
-        add_dirs=[str(run.work)],
-        env=run.env(),
-        setting_sources=[],  # ignore user/project settings, hooks and CLAUDE.md files
-        hooks={"PreToolUse": [HookMatcher(hooks=[make_guard(policy)])]},
-        model=limits.model,
-        max_turns=limits.max_turns,
-    )
-
-
 class Transcript:
-    """Append-only JSON Lines record of everything sent to and received from the agent."""
+    """Append-only JSON Lines record of everything sent to and received from the model."""
 
     def __init__(self, path: Path):
         self.path = path
@@ -201,33 +219,66 @@ class Transcript:
         self.file.write(json.dumps(record, default=str) + "\n")
         self.file.flush()
 
-    def message(self, message):
-        data = dataclasses.asdict(message) if dataclasses.is_dataclass(message) else repr(message)
-        self.write("message", type=type(message).__name__, message=data)
-
     def close(self):
         self.file.close()
 
 
-async def agent_turn(client, prompt: str, transcript: Transcript) -> ResultMessage | None:
-    transcript.write("prompt", text=prompt)
-    await client.query(prompt)
-    result = None
-    async for message in client.receive_response():
-        transcript.message(message)
-        if isinstance(message, AssistantMessage):
-            for block in message.content:
-                if isinstance(block, TextBlock):
-                    print(block.text, file=sys.stderr)
-                elif isinstance(block, ToolUseBlock):
-                    detail = block.input.get("command") or block.input.get("file_path") or block.input.get("pattern", "")
-                    print(f"[{block.name}] {detail}", file=sys.stderr)
-        elif isinstance(message, ResultMessage):
-            result = message
-            if message.is_error:
-                print(f"agent: turn ended with an error ({message.subtype}): {message.errors or message.result}",
-                      file=sys.stderr)
-    return result
+class AgentError(Exception):
+    """The model API failed in a way retrying does not fix."""
+
+
+def agent_loop(client, limits: Limits, messages: list, tools: Tools, transcript: Transcript, attempt: str) -> str:
+    """Call the model and run its tool calls until it answers without tools ("done") or runs out of turns."""
+    for turn in range(1, limits.max_turns + 1):
+        remaining = tools.remaining()
+        if remaining <= 0:
+            raise DeadlineExceeded()
+        try:
+            response = client.with_options(timeout=remaining).chat.completions.create(
+                model=limits.model, messages=messages, tools=SCHEMAS)
+        except openai.APITimeoutError:
+            if tools.remaining() <= 0:
+                raise DeadlineExceeded() from None
+            raise AgentError("the model API timed out") from None
+        except openai.APIStatusError as e:
+            raise AgentError(f"the model API refused the request (HTTP {e.status_code}): {e.body or e.message}") from None
+        except openai.APIConnectionError as e:
+            raise AgentError(f"could not reach the model API: {e}") from None
+        transcript.write("response", attempt=attempt, turn=turn, response=response.model_dump(exclude_none=True))
+        message = response.choices[0].message
+        calls = message.tool_calls or []
+        entry = {"role": "assistant", "content": message.content or ""}
+        if calls:
+            entry["tool_calls"] = [{"id": c.id, "type": "function",
+                                    "function": {"name": c.function.name, "arguments": c.function.arguments}}
+                                   for c in calls]
+        messages.append(entry)
+        if message.content:
+            print(message.content, file=sys.stderr)
+        if not calls:
+            return "done"
+        for call in calls:
+            print(f"[{call.function.name}] {_summary(call.function.arguments)}", file=sys.stderr)
+            result = tools.call(call.function.name, call.function.arguments)
+            transcript.write("tool", attempt=attempt, turn=turn, id=call.id, name=call.function.name,
+                             arguments=call.function.arguments, result=result)
+            messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
+    transcript.write("max_turns", attempt=attempt, turns=limits.max_turns)
+    print(f"agent: {attempt} stopped after the turn limit ({limits.max_turns})", file=sys.stderr)
+    return "max_turns"
+
+
+def _summary(arguments: str) -> str:
+    try:
+        args = json.loads(arguments)
+    except json.JSONDecodeError:
+        return arguments[:200]
+    if isinstance(args, dict):
+        text = args.get("command") or args.get("path") or args.get("pattern") or ""
+        if "content" in args:
+            text = f"findings.json ({len(args['content'])} characters)"
+        return str(text)[:300]
+    return arguments[:200]
 
 
 def findings_errors(run_dir: Path) -> list[str]:
@@ -238,31 +289,32 @@ def findings_errors(run_dir: Path) -> list[str]:
         return e.errors
 
 
-async def session(run: Run, limits: Limits, task: str, transcript: Transcript) -> list[str]:
-    """One agent session: the analysis, then at most one retry if findings.json is invalid."""
+def session(client, run: Run, limits: Limits, task: str, transcript: Transcript, deadline: float) -> list[str]:
+    """One agent conversation: the analysis, then at most one retry if findings.json is invalid."""
+    tools = Tools(policy=run.policy(limits), env=run.env(), deadline=deadline)
+    messages = [{"role": "system", "content": system_prompt(limits)}, {"role": "user", "content": task}]
+    transcript.write("prompt", attempt="analysis", text=task)
     errors: list[str] = []
-    async with ClaudeSDKClient(options=build_options(run, limits)) as client:
-        for attempt in ("analysis", "retry"):
-            prompt = task if attempt == "analysis" else load_prompt(
-                "retry", errors="\n".join(f"- {e}" for e in errors),
-                findings=run.run_dir / "findings.json", validate_command=run.commands()["validate_command"])
-            try:
-                await agent_turn(client, prompt, transcript)
-            except ResultError as e:  # the turn ended with an error result, e.g. max turns
-                transcript.write("error", attempt=attempt, error=str(e), subtype=e.subtype)
-                print(f"agent: {attempt} ended with an error ({e.terminal_reason or e.subtype}): {e}", file=sys.stderr)
-            errors = findings_errors(run.run_dir)
-            transcript.write("validation", attempt=attempt, errors=errors)
-            if not errors:
-                return []
-            if attempt == "analysis":
-                print(f"findings.json is invalid ({len(errors)} problem(s)); asking the agent to fix it once.",
-                      file=sys.stderr)
+    for attempt in ("analysis", "retry"):
+        if attempt == "retry":
+            retry = load_prompt("retry", errors="\n".join(f"- {e}" for e in errors),
+                                findings=run.run_dir / "findings.json",
+                                validate_command=run.commands()["validate_command"])
+            messages.append({"role": "user", "content": retry})
+            transcript.write("prompt", attempt="retry", text=retry)
+        agent_loop(client, limits, messages, tools, transcript, attempt)
+        errors = findings_errors(run.run_dir)
+        transcript.write("validation", attempt=attempt, errors=errors)
+        if not errors:
+            return []
+        if attempt == "analysis":
+            print(f"findings.json is invalid ({len(errors)} problem(s)); asking the agent to fix it once.",
+                  file=sys.stderr)
     return errors
 
 
-async def run(cfg: TargetConfig, config_path: Path, root: Path, run_id: str, *, label: str | None = None,
-              mpi: bool = False, limits: Limits = Limits(), goal: str | None = None) -> int:
+def run(cfg: TargetConfig, config_path: Path, root: Path, run_id: str, *, client, label: str | None = None,
+        mpi: bool = False, limits: Limits = Limits(), goal: str | None = None, base_url: str = DEFAULT_BASE_URL) -> int:
     r = Run(cfg=cfg, config_path=Path(config_path), root=Path(root).resolve(), run_id=run_id, mpi=mpi, label=label)
     # Preflight is the only step before the agent: it is cheap and stops a run that cannot profile.
     if run_script("preflight.sh", "--output", str(r.preflight), cwd=r.root):
@@ -275,15 +327,21 @@ async def run(cfg: TargetConfig, config_path: Path, root: Path, run_id: str, *, 
     transcript = Transcript(r.run_dir / "transcript.jsonl")
     task = task_prompt(r, limits, preflight, goal)
     transcript.write("start", run_id=run_id, target=cfg.target, mpi=mpi, limits=dataclasses.asdict(limits),
-                     tools=TOOLS, system_prompt=system_prompt(limits))
+                     base_url=base_url, tools=[t["function"]["name"] for t in SCHEMAS],
+                     system_prompt=system_prompt(limits))
+    deadline = time.monotonic() + limits.timeout_s
     status = OK
     try:
-        errors = await asyncio.wait_for(session(r, limits, task, transcript), timeout=limits.timeout_s)
-    except asyncio.TimeoutError:
+        errors = session(client, r, limits, task, transcript, deadline)
+    except DeadlineExceeded:
         print(f"error: wall-clock limit of {limits.timeout_s / 60:g} minutes reached; the agent was stopped",
               file=sys.stderr)
         transcript.write("timeout", seconds=limits.timeout_s)
         errors, status = findings_errors(r.run_dir), TIMED_OUT
+    except AgentError as e:
+        print(f"error: {e}", file=sys.stderr)
+        transcript.write("error", error=str(e))
+        errors, status = findings_errors(r.run_dir), FAILED
 
     (r.run_dir / "report.md").unlink(missing_ok=True)  # the report is always generated, never the agent's
     if errors:
@@ -320,9 +378,10 @@ def main(argv: list[str] | None = None) -> int:
                          help="build and profile the config's MPI variant with its default rank count")
     analyze.add_argument("--goal", help="extra focus for the analysis, e.g. 'memory behaviour'")
     group = analyze.add_argument_group("limits")
-    group.add_argument("--model", help="Claude model (default: the SDK's default)")
+    group.add_argument("--model", default=DEFAULT_MODEL,
+                       help=f"HokieAI model (default {DEFAULT_MODEL}; your subscription decides which are allowed)")
     group.add_argument("--max-turns", type=int, default=Limits.max_turns,
-                       help=f"agent turns for the analysis and for the retry (default {Limits.max_turns})")
+                       help=f"model calls for the analysis and for the retry (default {Limits.max_turns})")
     group.add_argument("--timeout", default="60m", metavar="DURATION",
                        help="wall-clock limit for the agent, e.g. 45m or 2h (default 60m)")
     group.add_argument("--max-experiments", type=int, default=Limits.max_experiments,
@@ -348,8 +407,11 @@ def main(argv: list[str] | None = None) -> int:
         analyze.error(f"invalid run id {run_id!r}: use letters, digits, '.', '_' or '-'")
     if (Path.cwd() / "runs" / run_id).exists():
         analyze.error(f"runs/{run_id} already exists; choose another --run-id")
-    return asyncio.run(run(cfg, args.config, Path.cwd(), run_id, label=args.label, mpi=args.mpi,
-                           limits=limits, goal=args.goal))
+    key, base_url = hokieai_settings(Path.cwd())
+    if not key:
+        analyze.error(f"{KEY_VAR} is not set: put your HokieAI key in .env ({KEY_VAR}=...) or the environment")
+    return run(cfg, args.config, Path.cwd(), run_id, client=make_client(key, base_url), label=args.label,
+               mpi=args.mpi, limits=limits, goal=args.goal, base_url=base_url)
 
 
 if __name__ == "__main__":

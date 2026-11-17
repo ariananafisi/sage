@@ -2,7 +2,7 @@ findings.json did not pass validation:
 
 {{errors}}
 
-Fix every problem above in {{findings}}: use Edit or Write, and do not run new experiments. Then
+Fix every problem above in {{findings}}: rewrite it with write_findings, and do not run new experiments. Then
 run the validate command again:
 
   {{validate_command}}

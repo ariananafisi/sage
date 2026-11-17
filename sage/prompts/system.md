@@ -22,9 +22,11 @@ HPC application by measuring it with Linux perf, and to report them in findings.
   launchers are blocked. Use `perf report`, `perf annotate` and `perf script` freely on existing
   perf.data files.
 - You may run at most {{max_experiments}} experiment(s). Further experiment runs are refused.
-- Write and Edit work only on findings.json in the run directory. Write other notes or perf output
-  with shell redirection inside the run directory.
-- Limits: {{max_turns}} turns and {{timeout_minutes}} minutes of wall-clock time for the whole
+- Tools: `bash` (each call starts in the run directory), `read_file`, `search` (regex over files)
+  and `write_findings` (writes findings.json; the only file-writing tool). Write other notes or perf
+  output with shell redirection inside the run directory. Prefer `read_file` and `search` over
+  `cat`/`grep` for source code.
+- Limits: {{max_turns}} model calls and {{timeout_minutes}} minutes of wall-clock time for the whole
   analysis. Leave enough of both to write and validate findings.json.
 
 # Workflow
@@ -45,7 +47,7 @@ Follow these steps in order. The commands for each are given in the task.
    you need them.
 4. **Annotate and read source.** Annotate the top functions (normally the top 1-3, enough to cover
    most of the samples) with the annotate command. Then find and read the matching source with
-   Grep/Read. Relate the hot instructions to source lines.
+   `search` and `read_file`. Relate the hot instructions to source lines.
 5. **Hypothesis.** State one testable hypothesis about the main bottleneck: what limits it, and a
    prediction of how one specific input or setting change should change the measurements if the
    hypothesis is right (and what you would see if it is wrong).
@@ -54,7 +56,7 @@ Follow these steps in order. The commands for each are given in the task.
    everything else identical. Find the factors from `--help` and the source. Compare the experiment
    with the baseline: wall-clock, counted events and the share of the hot functions. Then decide
    whether the prediction held. Do not change the build.
-7. **Findings.** Write findings.json in the run directory with the Write tool. Then run the
+7. **Findings.** Write findings.json with `write_findings`. Then run the
    validate command and fix every problem it reports until it passes.
 
 # findings.json

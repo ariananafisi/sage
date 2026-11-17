@@ -1,9 +1,8 @@
-"""Safety rails for the agent, enforced in a PreToolUse hook and checked again after the run.
+"""Safety rails for the agent's shell tool, checked before each command and again after the run.
 
-The hook (``make_guard``) denies:
+``check_bash`` refuses:
   * profilers other than perf;
   * shell commands that would edit, move or delete a file tracked in the source checkout;
-  * the Write/Edit tools on anything but the run's findings.json;
   * running the application other than through scripts/profile_target.sh (direct ``perf
     stat/record``, the binary itself except ``--help``, MPI launchers), so every run is recorded;
   * artifact sets outside <run>/baseline and <run>/experiments, and experiments beyond the limit.
@@ -21,7 +20,6 @@ import shlex
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 OTHER_PROFILERS = re.compile(
     r"\b(gprof|valgrind|callgrind|cachegrind|vtune|amplxe-cl|advixe-cl|"
@@ -43,7 +41,6 @@ PERF_READ_ONLY = {"report", "annotate", "script", "diff", "evlist", "list", "ver
                   "buildid-list", "data", "--version", "-v", "--help", "-h"}
 LAUNCHERS = {"mpirun", "mpiexec", "orterun", "srun", "aprun", "jsrun"}
 HELP_FLAGS = {"-h", "--help", "-help"}
-EDIT_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 
 
 def tracked(src: Path) -> set[str]:
@@ -267,37 +264,6 @@ def _check_profile(args: list[str], policy: Policy, cwd: str) -> str | None:
             f"{policy.experiments} for experiments (got --runs {runs} and run id '{run_id}').")
 
 
-def check_write(tool_input: dict, policy: Policy, cwd: str) -> str | None:
-    path = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
-    target = Path(os.path.normpath(os.path.join(cwd, path)))
-    allowed = policy.run_dir / "findings.json"
-    if target != allowed or target.is_symlink():
-        return f"The file-writing tools may only write {allowed}."
-    return None
-
-
-def make_guard(policy: Policy):
-    """Build the PreToolUse hook for one run."""
-
-    async def guard(input_data: dict[str, Any], tool_use_id: str | None, context: Any) -> dict[str, Any]:
-        tool = input_data.get("tool_name")
-        tool_input = input_data.get("tool_input", {}) or {}
-        cwd = input_data.get("cwd") or str(policy.run_dir)
-        reason = None
-        if tool in EDIT_TOOLS:
-            reason = check_write(tool_input, policy, cwd) if tool in ("Write", "Edit") else \
-                f"{tool} is disabled; use Write or Edit on findings.json."
-        elif tool == "Bash":
-            command = tool_input.get("command", "")
-            reason = check_command(command, tracked(policy.src), cwd) or check_execution(command, policy, cwd)
-        if reason is None:
-            return {}
-        return {
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "deny",
-                "permissionDecisionReason": reason,
-            }
-        }
-
-    return guard
+def check_bash(command: str, policy: Policy, cwd: str) -> str | None:
+    """Reason to refuse a shell command from the agent, or None to run it."""
+    return check_command(command, tracked(policy.src), cwd) or check_execution(command, policy, cwd)
