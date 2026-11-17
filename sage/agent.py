@@ -227,15 +227,31 @@ class AgentError(Exception):
     """The model API failed in a way retrying does not fix."""
 
 
-def agent_loop(client, limits: Limits, messages: list, tools: Tools, transcript: Transcript, attempt: str) -> str:
-    """Call the model and run its tool calls until it answers without tools ("done") or runs out of turns."""
-    for turn in range(1, limits.max_turns + 1):
+RATE_LIMIT_WAITS = (15, 30, 60, 60)  # seconds; HokieAI's token limits renew every 60 s
+sleep = time.sleep  # replaced in tests
+
+
+def complete(client, limits: Limits, messages: list, tools: Tools, transcript: Transcript):
+    """One model call. A 429 (HokieAI token or request limit) is waited out, within the wall clock."""
+    for attempt, wait in enumerate((*RATE_LIMIT_WAITS, None)):
         remaining = tools.remaining()
         if remaining <= 0:
             raise DeadlineExceeded()
         try:
-            response = client.with_options(timeout=remaining).chat.completions.create(
+            return client.with_options(timeout=remaining).chat.completions.create(
                 model=limits.model, messages=messages, tools=SCHEMAS)
+        except openai.RateLimitError as e:
+            if wait is None:
+                raise AgentError(f"HokieAI kept refusing with HTTP 429 after {len(RATE_LIMIT_WAITS)} waits: "
+                                 f"{e.body or e.message}") from None
+            retry_after = e.response.headers.get("retry-after") if e.response is not None else None
+            if retry_after and retry_after.replace(".", "", 1).isdigit():
+                wait = max(float(retry_after), 1)
+            if tools.remaining() <= wait:
+                raise DeadlineExceeded() from None
+            print(f"agent: HokieAI rate limit (HTTP 429: {e.body or e.message}); waiting {wait:g} s", file=sys.stderr)
+            transcript.write("rate_limited", wait_s=wait, error=str(e.body or e.message))
+            sleep(wait)
         except openai.APITimeoutError:
             if tools.remaining() <= 0:
                 raise DeadlineExceeded() from None
@@ -244,6 +260,12 @@ def agent_loop(client, limits: Limits, messages: list, tools: Tools, transcript:
             raise AgentError(f"the model API refused the request (HTTP {e.status_code}): {e.body or e.message}") from None
         except openai.APIConnectionError as e:
             raise AgentError(f"could not reach the model API: {e}") from None
+
+
+def agent_loop(client, limits: Limits, messages: list, tools: Tools, transcript: Transcript, attempt: str) -> str:
+    """Call the model and run its tool calls until it answers without tools ("done") or runs out of turns."""
+    for turn in range(1, limits.max_turns + 1):
+        response = complete(client, limits, messages, tools, transcript)
         transcript.write("response", attempt=attempt, turn=turn, response=response.model_dump(exclude_none=True))
         message = response.choices[0].message
         calls = message.tool_calls or []

@@ -326,6 +326,12 @@ still invalid, the run fails with exit code 4, lists the remaining problems, and
 Hitting the turn limit is handled the same way: the findings are validated, and if they are not
 valid, the retry is used.
 
+If HokieAI answers HTTP 429 (its token or request limits, which renew every 60 seconds), SAGE waits
+and retries the call. It waits for the `Retry-After` time if the gateway sends one, otherwise 15,
+30, 60 and 60 seconds, but never past the wall-clock limit. If the limit persists, the run fails
+with exit code 1. One analysis sends roughly 1M input tokens, most of them served from the
+gateway's prompt cache, so starting runs back to back can hit a per-minute limit.
+
 Reaching the wall-clock limit stops the agent immediately and exits 5. If a valid `findings.json`
 already exists, the report is still generated.
 

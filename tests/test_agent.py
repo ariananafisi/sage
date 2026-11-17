@@ -362,6 +362,43 @@ def test_api_refusal_fails_clearly(cfg, tmp_path, fake, capsys):
     assert transcript(tmp_path)[-1]["status"] == agent.FAILED
 
 
+@pytest.fixture
+def no_sleep(monkeypatch):
+    waits = []
+    monkeypatch.setattr(agent, "sleep", waits.append)
+    return waits
+
+
+def rate_limited(d):
+    raise api_error(429, {"statusCode": 429, "message": "OpenAI token limit is already exceeded"})
+
+
+def test_rate_limit_is_waited_out(cfg, tmp_path, fake, no_sleep, capsys):
+    status, client = go(cfg, tmp_path, [rate_limited, rate_limited, write_valid, done])
+    assert status == agent.OK and no_sleep == [15, 30] and len(client.requests) == 4
+    assert "HokieAI rate limit (HTTP 429" in capsys.readouterr().err
+    assert [r["wait_s"] for r in transcript(tmp_path) if r["kind"] == "rate_limited"] == [15, 30]
+
+
+def test_rate_limit_honours_retry_after(cfg, tmp_path, fake, no_sleep):
+    def with_header(d):
+        request = HTTPX.Request("POST", "https://gateway.example/openai/v1/chat/completions")
+        response = HTTPX.Response(429, request=request, headers={"retry-after": "7"})
+        raise openai.RateLimitError("limit", response=response, body={"message": "limit"})
+    assert go(cfg, tmp_path, [with_header, write_valid, done])[0] == agent.OK and no_sleep == [7]
+
+
+def test_persistent_rate_limit_fails_clearly(cfg, tmp_path, fake, no_sleep, capsys):
+    status, client = go(cfg, tmp_path, [rate_limited] * 5)
+    assert status == agent.FAILED and no_sleep == list(agent.RATE_LIMIT_WAITS)
+    assert "HokieAI kept refusing with HTTP 429 after 4 waits" in capsys.readouterr().err
+
+
+def test_rate_limit_wait_never_passes_the_deadline(cfg, tmp_path, fake, no_sleep):
+    status, _ = go(cfg, tmp_path, [rate_limited], limits=agent.Limits(timeout_s=5))
+    assert status == agent.TIMED_OUT and no_sleep == []
+
+
 def test_api_connection_error_fails_clearly(cfg, tmp_path, fake, capsys):
     def unreachable(d):
         raise openai.APIConnectionError(request=HTTPX.Request("POST", "https://gateway.example/x"))
