@@ -5,3 +5,8 @@ __pycache__/
 .work/
 runs/
 build/
+
+# secrets: never commit
+.env
+.env.*
+!.env.example
