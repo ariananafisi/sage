@@ -93,6 +93,11 @@ class Policy:
     run_dir: Path
     binaries: frozenset[str]  # basenames of the target's binaries
     max_experiments: int
+    hidden: tuple[Path, ...] = ()  # paths the agent must not read (eval answers); absolute
+
+    def is_hidden(self, path: Path) -> bool:
+        resolved = Path(path).resolve()
+        return any(resolved == h or resolved.is_relative_to(h) for h in self.hidden)
 
     @property
     def experiments(self) -> Path:
@@ -264,6 +269,18 @@ def _check_profile(args: list[str], policy: Policy, cwd: str) -> str | None:
             f"{policy.experiments} for experiments (got --runs {runs} and run id '{run_id}').")
 
 
+HIDDEN_REASON = "That path is outside the analysis and cannot be accessed."
+
+
+def check_hidden(command: str, policy: Policy) -> str | None:
+    """Refuse commands that name a hidden path, by absolute path or by its last component."""
+    for h in policy.hidden:
+        if str(h) in command or re.search(rf"(?<![\w.-]){re.escape(h.name)}(?![\w.-])", command):
+            return HIDDEN_REASON
+    return None
+
+
 def check_bash(command: str, policy: Policy, cwd: str) -> str | None:
     """Reason to refuse a shell command from the agent, or None to run it."""
-    return check_command(command, tracked(policy.src), cwd) or check_execution(command, policy, cwd)
+    return (check_hidden(command, policy) or check_command(command, tracked(policy.src), cwd)
+            or check_execution(command, policy, cwd))

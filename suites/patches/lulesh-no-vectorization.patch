@@ -1,0 +1,23 @@
+diff --git a/lulesh.cc b/lulesh.cc
+index c840817..7c980d7 100644
+--- a/lulesh.cc
++++ b/lulesh.cc
+@@ -664,6 +664,9 @@ void CalcElemVolumeDerivative(Real_t dvdx[8],
+ 
+ /******************************************/
+ 
++#pragma GCC push_options
++#pragma GCC optimize ("no-tree-vectorize")
++
+ static inline
+ void CalcElemFBHourglassForce(Real_t *xd, Real_t *yd, Real_t *zd,  Real_t hourgam[][4],
+                               Real_t coefficient,
+@@ -992,6 +995,8 @@ void CalcFBHourglassForceForElems( Domain &domain,
+ 
+ /******************************************/
+ 
++#pragma GCC pop_options
++
+ static inline
+ void CalcHourglassControlForElems(Domain& domain,
+                                   Real_t determ[], Real_t hgcoef)

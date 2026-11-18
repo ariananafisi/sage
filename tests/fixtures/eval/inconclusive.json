@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "run_id": "case-1",
+  "target": "lulesh",
+  "status": "inconclusive",
+  "summary": "fixture",
+  "findings": []
+}

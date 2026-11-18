@@ -1,0 +1,27 @@
+# Evaluation suite for LULESH: bottleneck-agent eval --suite suites/lulesh.yaml
+# Each case runs on a fresh copy of the pinned source (configs/lulesh.yaml), changed by its patch.
+name: lulesh
+target: lulesh
+config: ../configs/lulesh.yaml
+# Bottleneck types that the suite injects; reporting one in a case that did not inject it is a false positive.
+false_positive_types: [load_imbalance, poor_vectorization]
+cases:
+  - id: negative-control
+    description: Unmodified pinned source. Nothing is injected.
+    expect: none
+  - id: load-imbalance
+    description: >-
+      Extra work for the first quarter of elements in the CalcFBHourglassForceForElems OpenMP loop.
+      With OpenMP's static schedule, all of it lands on thread 0 while the other threads wait.
+    patch: patches/lulesh-load-imbalance.patch
+    expect:
+      function: CalcFBHourglassForceForElems
+      bottleneck_types: [load_imbalance]
+  - id: no-vectorization
+    description: >-
+      Auto-vectorization disabled (GCC optimize pragma) for CalcFBHourglassForceForElems and its
+      inlined helper; everything else, including the build flags, is unchanged.
+    patch: patches/lulesh-no-vectorization.patch
+    expect:
+      function: CalcFBHourglassForceForElems
+      bottleneck_types: [poor_vectorization]

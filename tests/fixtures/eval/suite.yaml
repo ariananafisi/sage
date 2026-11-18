@@ -1,0 +1,20 @@
+name: fixture
+target: lulesh
+config: ../../../configs/lulesh.yaml
+false_positive_types: [load_imbalance, poor_vectorization]
+cases:
+  - id: negative-control
+    description: unmodified source
+    expect: none
+  - id: load-imbalance
+    description: extra work on thread 0
+    patch: patches/add-comment.patch
+    expect:
+      function: CalcFBHourglassForceForElems
+      bottleneck_types: [load_imbalance]
+  - id: broken
+    description: a patch that does not apply
+    patch: patches/does-not-apply.patch
+    expect:
+      function: main
+      bottleneck_types: [poor_vectorization]

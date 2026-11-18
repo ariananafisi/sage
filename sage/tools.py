@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .guard import Policy, check_bash
+from .guard import HIDDEN_REASON, Policy, check_bash
 
 MAX_OUTPUT = 20_000  # characters of tool output returned to the model
 MAX_COMMAND_SECONDS = 1800  # a single shell command (builds and profiles take a few minutes)
@@ -135,6 +135,8 @@ class Tools:
 
     def read_file(self, path: str, offset: int = 1, limit: int = 400) -> str:
         p = self._path(path)
+        if self.policy.is_hidden(p):
+            return f"ERROR: {HIDDEN_REASON}"
         if not p.is_file():
             return f"ERROR: {p} is not a file."
         offset, limit = max(1, int(offset)), min(max(1, int(limit)), MAX_READ_LINES)
@@ -153,14 +155,16 @@ class Tools:
         except re.error as e:
             return f"ERROR: invalid regular expression: {e}"
         root = self._path(path)
+        if self.policy.is_hidden(root):
+            return f"ERROR: {HIDDEN_REASON}"
         if not root.exists():
             return f"ERROR: {root} does not exist."
         files = [root]
         if root.is_dir():
             files = []
             for d, dirs, names in os.walk(root):
-                dirs[:] = sorted(x for x in dirs if x != ".git")
-                files += [Path(d, n) for n in sorted(names)]
+                dirs[:] = sorted(x for x in dirs if x != ".git" and not self.policy.is_hidden(Path(d, x)))
+                files += [Path(d, n) for n in sorted(names) if not self.policy.is_hidden(Path(d, n))]
         results = []
         for f in files:
             if glob and not fnmatch.fnmatch(f.name, glob):

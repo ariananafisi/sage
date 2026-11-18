@@ -1,0 +1,27 @@
+# Evaluation suite for CoMD: bottleneck-agent eval --suite suites/comd.yaml
+# Each case runs on a fresh copy of the pinned source (configs/comd.yaml), changed by its patch.
+name: comd
+target: comd
+config: ../configs/comd.yaml
+# Bottleneck types that the suite injects; reporting one in a case that did not inject it is a false positive.
+false_positive_types: [load_imbalance, poor_vectorization]
+cases:
+  - id: negative-control
+    description: Unmodified pinned source, MPI build with the config's rank count (the same setup as load-imbalance).
+    mpi: true
+    expect: none
+  - id: load-imbalance
+    description: >-
+      Rank 0 does extra work at the end of ljForce every step; the other ranks wait for it in the next
+      communication.
+    patch: patches/comd-load-imbalance.patch
+    mpi: true
+    expect:
+      function: ljForce
+      bottleneck_types: [load_imbalance]
+  - id: no-vectorization
+    description: Auto-vectorization disabled (GCC optimize pragma) for ljForce.c; build flags unchanged.
+    patch: patches/comd-no-vectorization.patch
+    expect:
+      function: ljForce
+      bottleneck_types: [poor_vectorization]

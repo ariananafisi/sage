@@ -1,0 +1,18 @@
+diff --git a/lulesh.cc b/lulesh.cc
+index c840817..7b294f0 100644
+--- a/lulesh.cc
++++ b/lulesh.cc
+@@ -791,6 +791,13 @@ void CalcFBHourglassForceForElems( Domain &domain,
+ 
+       const Index_t *elemToNode = domain.nodelist(i2);
+       Index_t i3=8*i2;
++      // Elements of the first block get an extra stabilisation pass.
++      if (i2 < numElem / 4) {
++         Real_t corr = Real_t(0.0);
++         for (Index_t k = 0; k < 256; ++k)
++            corr += x8n[i3 + (k & 7)] * Real_t(1.0e-12);
++         determ[i2] += corr * Real_t(0.0);
++      }
+       Real_t volinv=Real_t(1.0)/determ[i2];
+       Real_t ss1, mass1, volume13 ;
+       for(Index_t i1=0;i1<4;++i1){

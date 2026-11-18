@@ -1,0 +1,6 @@
+diff --git a/main.c b/main.c
+--- a/main.c
++++ b/main.c
+@@ -1 +1,2 @@
++/* injected */
+ int main(void) { return 0; }

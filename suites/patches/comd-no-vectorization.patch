@@ -1,0 +1,13 @@
+diff --git a/src-mpi/ljForce.c b/src-mpi/ljForce.c
+index ebc60e1..134bd16 100644
+--- a/src-mpi/ljForce.c
++++ b/src-mpi/ljForce.c
+@@ -61,6 +61,8 @@
+ 
+ #include "ljForce.h"
+ 
++#pragma GCC optimize ("no-tree-vectorize")
++
+ #include <stdlib.h>
+ #include <assert.h>
+ #include <string.h>

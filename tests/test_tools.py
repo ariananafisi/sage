@@ -154,3 +154,16 @@ def test_truncate_keeps_head_and_tail():
     out = truncate(text, limit=300)
     assert out.startswith("H" * 100) and out.endswith("T" * 100) and "omitted" in out
     assert truncate("short", limit=300) == "short"
+
+
+def test_read_and_search_skip_hidden_paths(tools, tmp_path):
+    secret = tmp_path / "suites"
+    secret.mkdir()
+    (secret / "answers.yaml").write_text("function: ljForce\n")
+    (tmp_path / "visible.txt").write_text("ljForce\n")
+    tools.policy = Policy(src=tools.policy.src, run_dir=tools.run_dir, binaries=tools.policy.binaries,
+                          max_experiments=1, hidden=(secret.resolve(),))
+    assert "outside the analysis" in tools.read_file(str(secret / "answers.yaml"))
+    assert "outside the analysis" in tools.search("ljForce", str(secret))
+    out = tools.search("ljForce", str(tmp_path))
+    assert "visible.txt" in out and "answers.yaml" not in out

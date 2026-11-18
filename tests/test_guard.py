@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from sage.guard import Policy, check_bash, check_command, check_execution, source_changes, tracked
+from sage.guard import HIDDEN_REASON, Policy, check_bash, check_command, check_execution, source_changes, tracked
 
 CWD = "/work"
 PROTECTED = {
@@ -219,3 +219,18 @@ def test_source_changes_without_git_metadata(checkout):
     src, commit = checkout
     subprocess.run(["rm", "-rf", str(src / ".git")], check=True)
     assert source_changes(src, commit) == [f"{src} is no longer a git checkout; its source cannot be verified"]
+
+
+def test_hidden_paths(policy, tmp_path):
+    suites = (tmp_path / "repo" / "suites").resolve()
+    results = (tmp_path / "out" / "results.json").resolve()
+    p = Policy(src=policy.src, run_dir=policy.run_dir, binaries=policy.binaries, max_experiments=1,
+               hidden=(suites, results))
+    cwd = str(policy.run_dir)
+    for cmd in [f"cat {suites}/comd.yaml", "cd /x/repo && cat suites/comd.yaml", "ls ../../suites",
+                "grep -r ljForce suites", f"cat {results}", "cat ../../results.json", "find / -name results.json"]:
+        assert check_bash(cmd, p, cwd) == HIDDEN_REASON, cmd
+    for cmd in ["cat baseline/perf-report.txt", "echo my-suites-notes", "ls results.jsonl"]:
+        assert check_bash(cmd, p, cwd) is None, cmd
+    assert p.is_hidden(suites / "patches" / "x.patch") and p.is_hidden(results)
+    assert not p.is_hidden(tmp_path / "repo" / "sage")

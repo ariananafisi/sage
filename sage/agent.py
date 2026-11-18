@@ -131,6 +131,7 @@ class Run:
     run_id: str
     mpi: bool = False
     label: str | None = None
+    hidden: tuple[Path, ...] = ()  # paths the agent may not read (used by eval)
 
     @property
     def work_root(self) -> Path: return self.root / ".work"
@@ -170,7 +171,8 @@ class Run:
     def policy(self, limits: Limits) -> Policy:
         binaries = [self.cfg.binary] + ([self.cfg.mpi.binary] if self.cfg.mpi else [])
         return Policy(src=self.src, run_dir=self.run_dir, max_experiments=limits.max_experiments,
-                      binaries=frozenset(Path(b).name for b in binaries))
+                      binaries=frozenset(Path(b).name for b in binaries),
+                      hidden=tuple(Path(h).resolve() for h in self.hidden))
 
 
 def _quote(text: str) -> str:
@@ -336,8 +338,10 @@ def session(client, run: Run, limits: Limits, task: str, transcript: Transcript,
 
 
 def run(cfg: TargetConfig, config_path: Path, root: Path, run_id: str, *, client, label: str | None = None,
-        mpi: bool = False, limits: Limits = Limits(), goal: str | None = None, base_url: str = DEFAULT_BASE_URL) -> int:
-    r = Run(cfg=cfg, config_path=Path(config_path), root=Path(root).resolve(), run_id=run_id, mpi=mpi, label=label)
+        mpi: bool = False, limits: Limits = Limits(), goal: str | None = None, base_url: str = DEFAULT_BASE_URL,
+        hidden: tuple[Path, ...] = ()) -> int:
+    r = Run(cfg=cfg, config_path=Path(config_path), root=Path(root).resolve(), run_id=run_id, mpi=mpi, label=label,
+            hidden=hidden)
     # Preflight is the only step before the agent: it is cheap and stops a run that cannot profile.
     if run_script("preflight.sh", "--output", str(r.preflight), cwd=r.root):
         print(f"error: preflight failed; see {r.preflight}", file=sys.stderr)
@@ -384,6 +388,33 @@ def run(cfg: TargetConfig, config_path: Path, root: Path, run_id: str, *, client
     return status
 
 
+def add_limit_options(parser: argparse.ArgumentParser):
+    group = parser.add_argument_group("limits")
+    group.add_argument("--model", default=DEFAULT_MODEL,
+                       help=f"HokieAI model (default {DEFAULT_MODEL}; your subscription decides which are allowed)")
+    group.add_argument("--max-turns", type=int, default=Limits.max_turns,
+                       help=f"model calls for the analysis and for the retry (default {Limits.max_turns})")
+    group.add_argument("--timeout", default="60m", metavar="DURATION",
+                       help="wall-clock limit for the agent, e.g. 45m or 2h (default 60m; per case for eval)")
+    group.add_argument("--max-experiments", type=int, default=Limits.max_experiments,
+                       help=f"experiment runs the agent may make (default {Limits.max_experiments})")
+
+
+def limits_from(args, parser) -> Limits:
+    try:
+        return Limits(model=args.model, max_turns=args.max_turns, timeout_s=parse_duration(args.timeout),
+                      max_experiments=args.max_experiments)
+    except ValueError as e:
+        parser.error(str(e))
+
+
+def client_from(parser) -> tuple[openai.OpenAI, str]:
+    key, base_url = hokieai_settings(Path.cwd())
+    if not key:
+        parser.error(f"{KEY_VAR} is not set: put your HokieAI key in .env ({KEY_VAR}=...) or the environment")
+    return make_client(key, base_url), base_url
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="bottleneck-agent", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
@@ -399,16 +430,36 @@ def main(argv: list[str] | None = None) -> int:
     analyze.add_argument("--mpi", action="store_true",
                          help="build and profile the config's MPI variant with its default rank count")
     analyze.add_argument("--goal", help="extra focus for the analysis, e.g. 'memory behaviour'")
-    group = analyze.add_argument_group("limits")
-    group.add_argument("--model", default=DEFAULT_MODEL,
-                       help=f"HokieAI model (default {DEFAULT_MODEL}; your subscription decides which are allowed)")
-    group.add_argument("--max-turns", type=int, default=Limits.max_turns,
-                       help=f"model calls for the analysis and for the retry (default {Limits.max_turns})")
-    group.add_argument("--timeout", default="60m", metavar="DURATION",
-                       help="wall-clock limit for the agent, e.g. 45m or 2h (default 60m)")
-    group.add_argument("--max-experiments", type=int, default=Limits.max_experiments,
-                       help=f"experiment runs the agent may make (default {Limits.max_experiments})")
+    add_limit_options(analyze)
+    evaluate = commands.add_parser("eval", help="measure diagnosis accuracy on a suite of injected bottlenecks",
+                                   description="Run the agent on every case of a suite (fresh source copy each) "
+                                               "and score its findings; writes results.json and results.md.")
+    evaluate.add_argument("--suite", required=True, type=Path, metavar="PATH", help="suite YAML, e.g. suites/comd.yaml")
+    evaluate.add_argument("--out", type=Path, metavar="DIR",
+                          help="output directory (default: evals/<suite>-<timestamp>)")
+    evaluate.add_argument("--cases", metavar="ID,ID", help="run only these case ids")
+    add_limit_options(evaluate)
     args = parser.parse_args(argv)
+
+    if args.command == "eval":
+        from .evaluate import SuiteError, load_suite, run_suite
+        try:
+            suite = load_suite(args.suite)
+        except SuiteError as e:
+            evaluate.error(str(e))
+        only = [c.strip() for c in args.cases.split(",")] if args.cases else None
+        if only and (unknown := set(only) - {c.id for c in suite.cases}):
+            evaluate.error(f"unknown case id(s): {', '.join(sorted(unknown))} "
+                           f"(suite has {', '.join(c.id for c in suite.cases)})")
+        limits = limits_from(args, evaluate)
+        out = args.out or Path("evals") / f"{suite.name}-{time.strftime('%Y%m%d-%H%M%S')}"
+        if out.exists():
+            evaluate.error(f"{out} already exists; choose another --out")
+        client, base_url = client_from(evaluate)
+        results = run_suite(suite, out.resolve(), Path.cwd(), client, limits, base_url, only)
+        s = results["summary"]
+        print(f"\n{s['correct']} of {s['cases']} cases correct; results: {out / 'results.md'}")
+        return OK if s["errors"] == 0 else FAILED
 
     # Validate everything up front, before running anything or calling the API.
     if args.target not in TARGETS:
@@ -417,11 +468,7 @@ def main(argv: list[str] | None = None) -> int:
         cfg = load_config(args.config, args.target)
     except ConfigError as e:
         analyze.error(str(e))
-    try:
-        limits = Limits(model=args.model, max_turns=args.max_turns, timeout_s=parse_duration(args.timeout),
-                        max_experiments=args.max_experiments)
-    except ValueError as e:
-        analyze.error(str(e))
+    limits = limits_from(args, analyze)
     if args.mpi and cfg.mpi is None:
         analyze.error(f"--mpi needs an mpi section in {args.config}")
     run_id = args.run_id or f"{args.target}{'-mpi' if args.mpi else ''}-{time.strftime('%Y%m%d-%H%M%S')}"
@@ -429,10 +476,8 @@ def main(argv: list[str] | None = None) -> int:
         analyze.error(f"invalid run id {run_id!r}: use letters, digits, '.', '_' or '-'")
     if (Path.cwd() / "runs" / run_id).exists():
         analyze.error(f"runs/{run_id} already exists; choose another --run-id")
-    key, base_url = hokieai_settings(Path.cwd())
-    if not key:
-        analyze.error(f"{KEY_VAR} is not set: put your HokieAI key in .env ({KEY_VAR}=...) or the environment")
-    return run(cfg, args.config, Path.cwd(), run_id, client=make_client(key, base_url), label=args.label,
+    client, base_url = client_from(analyze)
+    return run(cfg, args.config, Path.cwd(), run_id, client=client, label=args.label,
                mpi=args.mpi, limits=limits, goal=args.goal, base_url=base_url)
 
 

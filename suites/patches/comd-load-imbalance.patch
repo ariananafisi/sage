@@ -1,0 +1,22 @@
+diff --git a/src-mpi/ljForce.c b/src-mpi/ljForce.c
+index ebc60e1..01fe126 100644
+--- a/src-mpi/ljForce.c
++++ b/src-mpi/ljForce.c
+@@ -228,6 +228,17 @@ int ljForce(SimFlat* s)
+       } // loop over neighbor boxes
+    } // loop over local boxes in system
+ 
++   // Rank 0 owns the reference region and refines its energy tally.
++   if (getMyRank() == 0)
++   {
++      real_t corr = 0.0;
++      for (int iBox=0; iBox<s->boxes->nLocalBoxes; iBox++)
++         for (int iOff=iBox*MAXATOMS,ii=0; ii<s->boxes->nAtoms[iBox]; ii++,iOff++)
++            for (int k=0; k<96; k++)
++               corr += s->atoms->r[iOff][k%3] * 1.0e-12;
++      ePot += corr * 0.0;
++   }
++
+    ePot = ePot*4.0*epsilon;
+    s->ePotential = ePot;
+ 
