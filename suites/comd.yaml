@@ -3,8 +3,10 @@
 name: comd
 target: comd
 config: ../configs/comd.yaml
-# Bottleneck types that the suite injects; reporting one in a case that did not inject it is a false positive.
-false_positive_types: [load_imbalance, poor_vectorization]
+# False positives: an injected bottleneck type reported for an injection site (a function the suite's patches
+# change) in a case that did not inject it there. Natural findings in other functions are not counted.
+false_positive_types: [load_imbalance, memory_latency_bound, memory_bandwidth_bound]
+injection_sites: [ljForce]
 cases:
   - id: negative-control
     description: Unmodified pinned source, MPI build with the config's rank count (the same setup as load-imbalance).
@@ -19,9 +21,11 @@ cases:
     expect:
       function: ljForce
       bottleneck_types: [load_imbalance]
-  - id: no-vectorization
-    description: Auto-vectorization disabled (GCC optimize pragma) for ljForce.c; build flags unchanged.
-    patch: patches/comd-no-vectorization.patch
+  - id: memory-bound
+    description: >-
+      Every atom in ljForce follows a chain of dependent, scattered reads through a 256 MB table (far larger
+      than the caches) each step, so the kernel waits on memory. Serial build, like the config's default run.
+    patch: patches/comd-memory-bound.patch
     expect:
       function: ljForce
-      bottleneck_types: [poor_vectorization]
+      bottleneck_types: [memory_latency_bound, memory_bandwidth_bound]

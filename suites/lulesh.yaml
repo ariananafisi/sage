@@ -3,8 +3,10 @@
 name: lulesh
 target: lulesh
 config: ../configs/lulesh.yaml
-# Bottleneck types that the suite injects; reporting one in a case that did not inject it is a false positive.
-false_positive_types: [load_imbalance, poor_vectorization]
+# False positives: an injected bottleneck type reported for an injection site (a function the suite's patches
+# change) in a case that did not inject it there. Natural findings in other functions are not counted.
+false_positive_types: [load_imbalance, memory_latency_bound, memory_bandwidth_bound]
+injection_sites: [CalcFBHourglassForceForElems]
 cases:
   - id: negative-control
     description: Unmodified pinned source. Nothing is injected.
@@ -17,11 +19,11 @@ cases:
     expect:
       function: CalcFBHourglassForceForElems
       bottleneck_types: [load_imbalance]
-  - id: no-vectorization
+  - id: memory-bound
     description: >-
-      Auto-vectorization disabled (GCC optimize pragma) for CalcFBHourglassForceForElems and its
-      inlined helper; everything else, including the build flags, is unchanged.
-    patch: patches/lulesh-no-vectorization.patch
+      Every element of the CalcFBHourglassForceForElems loop follows a chain of dependent, scattered reads
+      through a 256 MB table (far larger than the caches), so the kernel waits on memory.
+    patch: patches/lulesh-memory-bound.patch
     expect:
       function: CalcFBHourglassForceForElems
-      bottleneck_types: [poor_vectorization]
+      bottleneck_types: [memory_latency_bound, memory_bandwidth_bound]

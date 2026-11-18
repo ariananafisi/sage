@@ -47,7 +47,8 @@ class Case:
     patch: Path | None  # applied to the pinned source; None for an unmodified case
     mpi: bool
     expect: Expect | None  # None: a negative control, nothing was injected
-    false_positive_types: tuple[str, ...]  # findings of these types count as false positives
+    false_positive_types: tuple[str, ...]  # findings of these types count as false positives ...
+    injection_sites: tuple[str, ...] = ()  # ... if they name one of these functions (empty: any function)
 
 
 @dataclass(frozen=True)
@@ -72,7 +73,8 @@ def load_suite(path: Path) -> Suite:
         raise SuiteError(f"invalid suite {path}:\n  - top level must be a mapping")
     errors = [f"missing required key '{k}'" for k in ("name", "target", "config", "cases") if k not in data]
     errors += [f"unknown key '{k}'" for k in data
-               if k not in ("name", "target", "config", "cases", "description", "false_positive_types")]
+               if k not in ("name", "target", "config", "cases", "description", "false_positive_types",
+                            "injection_sites")]
     base = path.parent
     name, target = data.get("name"), data.get("target")
     if "name" in data and not (isinstance(name, str) and CASE_ID.fullmatch(name)):
@@ -89,6 +91,10 @@ def load_suite(path: Path) -> Suite:
         errors.append("config must be a path to the target config, relative to the suite file")
     default_fp = data.get("false_positive_types", [])
     errors += _check_types(default_fp, "false_positive_types")
+    sites = data.get("injection_sites", [])
+    if not isinstance(sites, list) or not all(isinstance(f, str) and re.fullmatch(r"[A-Za-z_]\w*", f) for f in sites):
+        errors.append("injection_sites must be a list of plain function names")
+        sites = []
 
     cases, seen = [], set()
     if "cases" in data and (not isinstance(data["cases"], list) or not data["cases"]):
@@ -139,7 +145,7 @@ def load_suite(path: Path) -> Suite:
             errors.append(f"{where}: a type cannot be both expected and a false positive")
         if isinstance(fp, list) and isinstance(cid, str):
             cases.append(Case(id=cid, description=str(raw.get("description", "")), patch=patch, mpi=bool(mpi),
-                              expect=expect,
+                              expect=expect, injection_sites=tuple(sites),
                               false_positive_types=tuple(t for t in fp if not expect or t not in expect.bottleneck_types)))
     if errors:
         raise SuiteError(f"invalid suite {path}:\n" + "\n".join(f"  - {e}" for e in errors))
@@ -184,7 +190,9 @@ def score(case: Case, findings: dict | None, status: int, run_dir: Path, duratio
         result["matched_rank"] = min(f["rank"] for f in right) if right else None
     result["false_positives"] = [{"rank": f["rank"], "function": f["function"], "bottleneck_type": f["bottleneck_type"]}
                                  for f in sorted(found, key=lambda f: f["rank"])
-                                 if f["bottleneck_type"] in case.false_positive_types]
+                                 if f["bottleneck_type"] in case.false_positive_types
+                                 and (not case.injection_sites
+                                      or any(function_matches(f["function"], site) for site in case.injection_sites))]
     result["correct"] = (findings is not None and status == agent.OK and not result["false_positives"]
                          and (case.expect is None or result["type_found"]))
     return result

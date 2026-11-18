@@ -396,6 +396,124 @@ python -m sage.findings render runs/comd-baseline
 `analyze` deletes any `report.md` the agent wrote. If `findings.json` is missing or invalid, it
 prints the problems, writes no report, and exits 4.
 
+## Evaluation
+
+`bottleneck-agent eval` measures how well the agent diagnoses bottlenecks whose cause is known. Run
+one suite per command:
+
+```bash
+bottleneck-agent eval --suite suites/lulesh.yaml
+```
+
+```bash
+bottleneck-agent eval --suite suites/comd.yaml --timeout 45m
+```
+
+Options:
+
+- `--out DIR`: the output directory (default `evals/<suite>-<timestamp>/`).
+- `--cases id,id`: run only some cases.
+- `--model`, `--max-turns`, `--timeout`, `--max-experiments`: the same limits as `analyze`, applied
+  to each case.
+
+Each case runs on a fresh copy of the pinned source, through the same pipeline as `analyze`:
+preflight, then the agent builds, profiles, experiments and writes `findings.json`. The copy is
+the pinned tree with the case's patch applied, committed as a single commit with no upstream
+history. The source check after the run compares against that commit.
+
+### Suites
+
+`suites/lulesh.yaml` and `suites/comd.yaml` each have three cases. The code changes are patch files
+in `suites/patches/`, and each case's expected result is in the suite YAML.
+
+| Case | LULESH (OpenMP, 4 threads) | CoMD |
+| --- | --- | --- |
+| `negative-control` | unmodified | unmodified, MPI with 4 ranks (the same setup as its load-imbalance case) |
+| `load-imbalance` | extra work for the first quarter of elements in `CalcFBHourglassForceForElems`; OpenMP's static schedule gives all of it to thread 0 | rank 0 does extra work at the end of `ljForce` every step; the other ranks wait in the halo exchange (MPI, 4 ranks) |
+| `memory-bound` | each element of `CalcFBHourglassForceForElems` follows dependent, scattered reads through a 256 MB table | atoms in `ljForce` follow one dependent chain of scattered reads through a 256 MB table |
+
+Measured on the development VM (4 vCPUs, software events only), against the unmodified build:
+
+| Case | Effect |
+| --- | --- |
+| LULESH load imbalance | wall 11.7 → 21.3 s; `CalcFBHourglassForceForElems` 8% → 16% of samples; more time in OpenMP spin-waiting |
+| LULESH memory-bound | wall 11.7 → 20.6 s; `CalcFBHourglassForceForElems` 8% → 39% of samples |
+| CoMD load imbalance | rank 0 spends 11.7 s in `force` vs 9.3 s for the fastest rank; the other ranks wait up to 2.4 s in the halo exchange (rank 0: 0.2 s) |
+| CoMD memory-bound | wall 16.0 → 24.1 s; the table lookup is the hottest source line of `ljForce` (30% of samples) |
+
+The suites originally had a "disabled vectorization" case instead of `memory-bound`. It was replaced
+because it could not be detected. GCC barely vectorizes either app's hot loops at `-O3`, whether
+built for generic x86-64 or for `x86-64-v3` (AVX2). LULESH's hourglass kernel gathers through node
+indices, and CoMD's pair loop has data-dependent branches. Disabling vectorization in the hot kernel
+changed run time by −2% to +10%, and the profile not at all, so a blind run looked the same as the
+unmodified one.
+
+### Suite format
+
+```yaml
+name: comd                         # lowercase letters, digits, '-'
+target: comd
+config: ../configs/comd.yaml       # relative to the suite file
+false_positive_types: [load_imbalance, memory_latency_bound, memory_bandwidth_bound]
+injection_sites: [ljForce]         # optional; see "False positives" below
+cases:
+  - id: negative-control
+    mpi: true                      # optional: use the config's MPI variant
+    expect: none                   # nothing injected
+  - id: load-imbalance
+    patch: patches/comd-load-imbalance.patch
+    mpi: true
+    expect:
+      function: ljForce            # a plain name; perf's decorated names (Foo(int) [clone ...]) match it
+      bottleneck_types: [load_imbalance]   # any of these counts as the right diagnosis
+```
+
+The suite is validated before anything runs, and all problems are reported together: keys,
+ids, patch paths, bottleneck types from the findings schema, the target config, and an MPI case
+without an MPI config.
+
+### Scoring
+
+For each case, `results.json` records:
+
+- **function found:** a finding names the expected function.
+- **type found:** a finding names the expected function with one of the expected bottleneck
+  types. That finding's rank is recorded.
+- **false positives:** findings that report one of the suite's injected bottleneck types for an
+  injection site (a function the suite's patches change), in a case that did not inject that type
+  there. A natural finding in another function is not a false positive. For example, LULESH's
+  OpenMP runtime spin-waits even when unmodified, and a "load imbalance in libgomp" finding there
+  is not counted.
+- **time:** wall-clock time for the case, including the build and all profiling.
+- **experiments:** how many experiment artifact sets the agent created, and their names.
+- the run's exit status, whether `findings.json` was valid, and every finding's rank, function,
+  type and confidence.
+
+A case is **correct** when the run succeeded with valid findings, the injected function and type
+were found (not required for a negative control), and there are no false positives. An
+inconclusive result on an injected case counts as a miss.
+
+`results.json` holds every case plus a summary: cases correct, functions and types found, cases
+with false positives, total experiments and total time. `results.md` presents the same as a table,
+plus each case's reported findings. Both are rewritten after every case, so an interrupted suite
+keeps its results.
+
+A case that fails is recorded with its error, and the suite continues with the next case. A failed
+case is, for example, a patch that no longer applies, a build error, or a crashed run.
+`eval` exits 1 if any case errored.
+
+### Keeping the agent blind
+
+- Cases run as `case-1`, `case-2`, …, so neither paths nor prompts say what was injected.
+- The source copy has a single neutral commit, so `git log` and `git diff` show nothing.
+- The suite directory (expectations and patches), the eval's `results.json` and `results.md`, and
+  the other cases' directories are hidden from the agent. Shell commands that name them are
+  refused, and `read_file` and `search` skip them. Like the other command checks, this is
+  best-effort pattern matching. Each case records `hidden_access_attempts`, and a non-zero count
+  means the agent went looking.
+
+`evals/` is git-ignored.
+
 ## Layout
 
 ```
@@ -504,6 +622,8 @@ Code: `scripts/preflight.sh` and `scripts/build_target.sh` (machine checks, chec
 | 3 | application source was modified |
 | 4 | `findings.json` is missing or still invalid after one retry; no report was written |
 | 5 | the wall-clock limit (`--timeout`) was reached |
+
+For `eval`: 0 when every case ran (whatever its score), 1 if any case errored, 2 for an invalid suite or options.
 
 ## Tests
 

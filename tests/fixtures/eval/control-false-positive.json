@@ -24,7 +24,24 @@
     },
     {
       "rank": 2,
-      "function": "CalcKinematicsForElems(Domain&, double, int) [clone ._omp_fn.0]",
+      "function": "CalcFBHourglassForceForElems(Domain&, double*, double*, double*, double*, double*, double*, double*, double, int, int) [clone ._omp_fn.0]",
+      "source_location": "lulesh.cc:782-963",
+      "sample_percent": 20.0,
+      "bottleneck_type": "load_imbalance",
+      "supporting_evidence": [
+        "measured in baseline/perf-report.txt"
+      ],
+      "likely_cause": "inference",
+      "experiment": "threads 4 -> 1",
+      "experiment_result": "supported",
+      "confidence": "low",
+      "artifact_paths": [
+        "baseline/perf-report.txt"
+      ]
+    },
+    {
+      "rank": 3,
+      "function": "libgomp.so.1.0.0 (OpenMP spin-wait)",
       "source_location": "lulesh.cc:782-963",
       "sample_percent": 20.0,
       "bottleneck_type": "load_imbalance",

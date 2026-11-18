@@ -1,0 +1,49 @@
+diff --git a/src-mpi/ljForce.c b/src-mpi/ljForce.c
+index ebc60e1..aff966d 100644
+--- a/src-mpi/ljForce.c
++++ b/src-mpi/ljForce.c
+@@ -164,6 +164,19 @@ int ljForce(SimFlat* s)
+    real_t rCut6 = s6 / (rCut2*rCut2*rCut2);
+    real_t eShift = POT_SHIFT * rCut6 * (rCut6 - 1.0);
+ 
++   // Pair correction table (32M entries), shared by all atoms.
++   static real_t* corrTable = NULL;
++   const unsigned int corrMask = (1u << 25) - 1;
++   if (corrTable == NULL)
++   {
++      corrTable = comdMalloc((corrMask + 1) * sizeof(real_t));
++      for (unsigned int i = 0; i <= corrMask; i++)
++         corrTable[i] = 0.0;
++   }
++
++   unsigned int corrIdx = 0;
++   real_t corrSum = 0.0;
++
+    int nbrBoxes[27];
+    // loop over local boxes
+    for (int iBox=0; iBox<s->boxes->nLocalBoxes; iBox++)
+@@ -171,6 +184,16 @@ int ljForce(SimFlat* s)
+       int nIBox = s->boxes->nAtoms[iBox];
+       if ( nIBox == 0 ) continue;
+       int nNbrBoxes = getNeighborBoxes(s->boxes, iBox, nbrBoxes);
++      // look up the pair corrections for the atoms of this box
++      for (int iOff=iBox*MAXATOMS,ii=0; ii<nIBox; ii++,iOff++)
++      {
++         for (int k=0; k<24; k++)
++         {
++            corrIdx = (corrIdx * 1103515245u + 12345u + (unsigned int)s->atoms->gid[iOff]
++                       + (unsigned int)corrSum) & corrMask;
++            corrSum += corrTable[corrIdx];
++         }
++      }
+       // loop over neighbors of iBox
+       for (int jTmp=0; jTmp<nNbrBoxes; jTmp++)
+       {
+@@ -228,6 +251,7 @@ int ljForce(SimFlat* s)
+       } // loop over neighbor boxes
+    } // loop over local boxes in system
+ 
++   ePot += corrSum * 0.0;
+    ePot = ePot*4.0*epsilon;
+    s->ePotential = ePot;
+ 

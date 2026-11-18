@@ -1,5 +1,5 @@
 diff --git a/lulesh.cc b/lulesh.cc
-index c840817..7b294f0 100644
+index c840817..bc4f230 100644
 --- a/lulesh.cc
 +++ b/lulesh.cc
 @@ -791,6 +791,13 @@ void CalcFBHourglassForceForElems( Domain &domain,
@@ -9,7 +9,7 @@ index c840817..7b294f0 100644
 +      // Elements of the first block get an extra stabilisation pass.
 +      if (i2 < numElem / 4) {
 +         Real_t corr = Real_t(0.0);
-+         for (Index_t k = 0; k < 256; ++k)
++         for (Index_t k = 0; k < 1024; ++k)
 +            corr += x8n[i3 + (k & 7)] * Real_t(1.0e-12);
 +         determ[i2] += corr * Real_t(0.0);
 +      }

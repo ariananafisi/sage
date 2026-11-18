@@ -1,0 +1,36 @@
+diff --git a/lulesh.cc b/lulesh.cc
+index c840817..729b0d6 100644
+--- a/lulesh.cc
++++ b/lulesh.cc
+@@ -775,6 +775,14 @@ void CalcFBHourglassForceForElems( Domain &domain,
+    gamma[3][6] = Real_t( 1.);
+    gamma[3][7] = Real_t(-1.);
+ 
++   // Hourglass correction table, shared by all elements (32M entries).
++   static Real_t *hgTable = 0;
++   const unsigned int hgMask = (1u << 25) - 1;
++   if (hgTable == 0) {
++      hgTable = new Real_t[hgMask + 1];
++      for (unsigned int i = 0; i <= hgMask; ++i) hgTable[i] = Real_t(0.0);
++   }
++
+ /*************************************************/
+ /*    compute the hourglass modes */
+ 
+@@ -791,6 +799,16 @@ void CalcFBHourglassForceForElems( Domain &domain,
+ 
+       const Index_t *elemToNode = domain.nodelist(i2);
+       Index_t i3=8*i2;
++      // Look up this element's hourglass correction.
++      {
++         Real_t corr = Real_t(0.0);
++         unsigned int idx = (unsigned int)i2 * 2654435761u;
++         for (int k = 0; k < 4; ++k) {
++            idx = (idx * 1103515245u + 12345u + (unsigned int)corr) & hgMask;
++            corr += hgTable[idx];
++         }
++         determ[i2] += corr * Real_t(0.0);
++      }
+       Real_t volinv=Real_t(1.0)/determ[i2];
+       Real_t ss1, mass1, volume13 ;
+       for(Index_t i1=0;i1<4;++i1){

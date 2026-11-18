@@ -25,11 +25,13 @@ def fixture(name):
     return json.loads((FIXTURES / name).read_text())
 
 
+SITES = ("CalcFBHourglassForceForElems",)
+MEMORY = ("memory_latency_bound", "memory_bandwidth_bound")
 IMBALANCE = Case(id="load-imbalance", description="", patch=None, mpi=False,
                  expect=Expect("CalcFBHourglassForceForElems", ("load_imbalance",)),
-                 false_positive_types=("poor_vectorization",))
+                 false_positive_types=MEMORY, injection_sites=SITES)
 CONTROL = Case(id="negative-control", description="", patch=None, mpi=False, expect=None,
-               false_positive_types=("load_imbalance", "poor_vectorization"))
+               false_positive_types=("load_imbalance", *MEMORY), injection_sites=SITES)
 
 
 # --- the shipped suites ---------------------------------------------------------------------
@@ -39,12 +41,15 @@ def test_shipped_suites_are_valid(target):
     suite = load_suite(REPO / "suites" / f"{target}.yaml")
     assert suite.target == target and suite.config == (REPO / "configs" / f"{target}.yaml").resolve()
     kinds = {c.id: c for c in suite.cases}
-    assert set(kinds) == {"negative-control", "load-imbalance", "no-vectorization"}
+    assert set(kinds) == {"negative-control", "load-imbalance", "memory-bound"}
     assert kinds["negative-control"].patch is None and kinds["negative-control"].expect is None
-    assert set(kinds["negative-control"].false_positive_types) == {"load_imbalance", "poor_vectorization"}
+    assert set(kinds["negative-control"].false_positive_types) == {"load_imbalance", *MEMORY}
     assert kinds["load-imbalance"].expect.bottleneck_types == ("load_imbalance",)
-    assert kinds["no-vectorization"].expect.bottleneck_types == ("poor_vectorization",)
-    for case in (kinds["load-imbalance"], kinds["no-vectorization"]):
+    assert set(kinds["memory-bound"].expect.bottleneck_types) == set(MEMORY)
+    site = {"lulesh": "CalcFBHourglassForceForElems", "comd": "ljForce"}[target]
+    assert all(c.injection_sites == (site,) for c in suite.cases)
+    assert kinds["load-imbalance"].mpi == (target == "comd") == kinds["negative-control"].mpi
+    for case in (kinds["load-imbalance"], kinds["memory-bound"]):
         assert case.patch.is_file() and case.patch.suffix == ".patch"
         assert case.patch.parent == REPO / "suites" / "patches"
         assert set(case.false_positive_types).isdisjoint(case.expect.bottleneck_types)
@@ -89,6 +94,8 @@ BASE = {"name": "s", "target": "lulesh", "config": str(REPO / "configs" / "lules
     ({"cases": [{"id": "a", "expect": {"function": "f", "bottleneck_types": ["load_imbalance"]},
                  "false_positive_types": ["load_imbalance"]}]}, "both expected and a false positive"),
     ({"cases": [{"id": "a", "expect": "none", "when": 1}]}, "cases[0]: unknown key 'when'"),
+    ({"injection_sites": ["f(int)"]}, "injection_sites must be a list of plain function names"),
+    ({"injection_sites": "ljForce"}, "injection_sites must be a list of plain function names"),
 ])
 def test_invalid_suites(tmp_path, change, message):
     with pytest.raises(SuiteError) as exc:
@@ -153,7 +160,9 @@ def test_score_right_function_wrong_type(tmp_path):
 
 
 def test_score_type_on_wrong_function_does_not_count(tmp_path):
-    result = score(IMBALANCE, fixture("control-false-positive.json"), agent.OK, run_dir_with(tmp_path), 10)
+    findings = fixture("found-imbalance.json")
+    findings["findings"][1]["function"] = "CalcKinematicsForElems(Domain&, double, int) [clone ._omp_fn.0]"
+    result = score(IMBALANCE, findings, agent.OK, run_dir_with(tmp_path), 10)
     assert not result["function_found"] and not result["type_found"] and not result["correct"]
 
 
@@ -162,16 +171,25 @@ def test_score_negative_control(tmp_path):
     assert clean["correct"] and clean["false_positives"] == [] and clean["function_found"] is None
     bad = score(CONTROL, fixture("control-false-positive.json"), agent.OK, run_dir_with(tmp_path), 10)
     assert not bad["correct"]
-    assert bad["false_positives"] == [{"rank": 2, "function": "CalcKinematicsForElems(Domain&, double, int) "
-                                       "[clone ._omp_fn.0]", "bottleneck_type": "load_imbalance"}]
+    # rank 2 claims imbalance in the injection site: counted; rank 3 claims it in libgomp: a natural
+    # finding outside the injection sites, not counted
+    assert bad["false_positives"] == [{"rank": 2, "function": LULESH_FN, "bottleneck_type": "load_imbalance"}]
     assert score(CONTROL, fixture("inconclusive.json"), agent.OK, run_dir_with(tmp_path), 10)["correct"]
 
 
 def test_score_false_positive_in_injected_case(tmp_path):
     findings = fixture("found-imbalance.json")
-    findings["findings"][0]["bottleneck_type"] = "poor_vectorization"
+    findings["findings"][0]["bottleneck_type"] = "memory_latency_bound"  # on libgomp: not an injection site
+    assert score(IMBALANCE, findings, agent.OK, run_dir_with(tmp_path), 10)["correct"]
+    findings["findings"][0]["function"] = "CalcFBHourglassForceForElems"  # now it is
     result = score(IMBALANCE, findings, agent.OK, run_dir_with(tmp_path), 10)
     assert result["type_found"] and len(result["false_positives"]) == 1 and not result["correct"]
+
+
+def test_without_injection_sites_any_function_counts(tmp_path):
+    anywhere = Case(id="c", description="", patch=None, mpi=False, expect=None, false_positive_types=("load_imbalance",))
+    result = score(anywhere, fixture("control-false-positive.json"), agent.OK, run_dir_with(tmp_path), 10)
+    assert [f["rank"] for f in result["false_positives"]] == [2, 3]
 
 
 @pytest.mark.parametrize("findings,status,label", [(None, agent.INVALID_FINDINGS, "invalid findings"),
@@ -194,8 +212,8 @@ def test_summarize_and_markdown(tmp_path):
          **score(CONTROL, fixture("control-false-positive.json"), agent.OK, run_dir_with(tmp_path), 100), "error": None},
         {"id": "load-imbalance", "run_id": "case-2", "patch": "imb.patch", "run_dir": "r2", "error": None,
          **score(IMBALANCE, fixture("found-imbalance.json"), agent.OK, run_dir_with(tmp_path, ["t1"]), 200)},
-        {"id": "no-vectorization", "run_id": "case-3", "patch": "novec.patch", "run_dir": "r3",
-         "expected": {"function": "ljForce", "bottleneck_types": ["poor_vectorization"]},
+        {"id": "memory-bound", "run_id": "case-3", "patch": "mem.patch", "run_dir": "r3",
+         "expected": {"function": "ljForce", "bottleneck_types": list(MEMORY)},
          "status": "error", "error": "RuntimeError: patch does not apply", "correct": False},
     ]
     s = summarize(cases)
@@ -206,10 +224,10 @@ def test_summarize_and_markdown(tmp_path):
                                    "suite_path": "suites/lulesh.yaml", "cases": cases, "summary": s})
     assert "**1 of 3 cases correct.**" in md
     assert "| negative-control (case-1) | none | nothing (negative control) | ok | n/a | n/a | " \
-           "CalcKinematicsForElems(Domain&, double, int) [clone ._omp_fn.0] (load_imbalance) | 0 | 100.0 | no |" in md
+           f"{LULESH_FN} (load_imbalance) | 0 | 100.0 | no |" in md
     assert "| load-imbalance (case-2) | imb.patch | `CalcFBHourglassForceForElems`: load_imbalance | ok | yes | yes | " \
            "none | 1 | 200.0 | **yes** |" in md
-    assert "| no-vectorization (case-3) | novec.patch |" in md and "| error |" in md
+    assert "| memory-bound (case-3) | mem.patch |" in md and "| error |" in md
     assert "Error: `RuntimeError: patch does not apply`" in md
 
 
