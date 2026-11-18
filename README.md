@@ -426,18 +426,44 @@ history. The source check after the run compares against that commit.
 `suites/lulesh.yaml` and `suites/comd.yaml` each have three cases. The code changes are patch files
 in `suites/patches/`, and each case's expected result is in the suite YAML.
 
+**LULESH's ground truth is a published roofline study.** The unmodified LULESH case is scored against
+the roofline analysis by A. Afzal, G. Hager and G. Wellein, ["Analytic Roofline Modeling and Energy
+Analysis of LULESH Proxy Application on Multi-Core Clusters"](https://arxiv.org/abs/2412.08792)
+(arXiv:2412.08792, 2024). In the OpenMP version, it finds five of the six hot functions
+memory-bound: `CalcHourglassControlForElems`, `CalcFBHourglassForceForElems`,
+`IntegrateStressForElems`, `CalcMonotonicQGradientsForElems` and `EvalEOSForElems`.
+`CalcKinematicsForElems` is not. The classification is recorded, with each function's measured
+computational intensity, in
+[`suites/references/lulesh-afzal2024.yaml`](suites/references/lulesh-afzal2024.yaml).
+
+Every LULESH case runs with the study's settings, `-s 90 -i 100 -b 0 -c 0`:
+
+- LULESH's built-in load imbalance is off (`-b 0 -c 0`).
+- The working set is about 650 MB, about 20× the last-level cache. The study required at least 10×.
+- 100 iterations instead of the study's 300, to keep a run near 25 s. The classification is per
+  iteration, so the count doesn't affect it.
+
+The study measured Intel Ice Lake and Sapphire Rapids nodes, using hardware counters, 13–18 cores
+per memory domain, and AVX-512 builds. A smaller machine, such as a 4-core VM, may stress memory
+bandwidth less. The comparison stays useful there, but it is not a measurement on the study's
+hardware.
+
+The agent never sees the study or its results. Its prompts contain no application-specific
+knowledge, and the reference file is in the hidden suite directory. The study is only used to score
+what the agent concludes from its own measurements.
+
 | Case | LULESH (OpenMP, 4 threads) | CoMD |
 | --- | --- | --- |
-| `negative-control` | unmodified | unmodified, MPI with 4 ranks (the same setup as its load-imbalance case) |
+| `negative-control` | unmodified; scored against the roofline study | unmodified, MPI with 4 ranks (the same setup as its load-imbalance case) |
 | `load-imbalance` | extra work for the first quarter of elements in `CalcFBHourglassForceForElems`; OpenMP's static schedule gives all of it to thread 0 | rank 0 does extra work at the end of `ljForce` every step; the other ranks wait in the halo exchange (MPI, 4 ranks) |
-| `memory-bound` | each element of `CalcFBHourglassForceForElems` follows dependent, scattered reads through a 256 MB table | atoms in `ljForce` follow one dependent chain of scattered reads through a 256 MB table |
+| `memory-bound` | each element of `CalcKinematicsForElems` (the one hot spot the study finds not memory-bound) follows dependent, scattered reads through a 256 MB table | atoms in `ljForce` follow one dependent chain of scattered reads through a 256 MB table |
 
 Measured on the development VM (4 vCPUs, software events only), against the unmodified build:
 
 | Case | Effect |
 | --- | --- |
-| LULESH load imbalance | wall 11.7 → 21.3 s; `CalcFBHourglassForceForElems` 8% → 16% of samples; more time in OpenMP spin-waiting |
-| LULESH memory-bound | wall 11.7 → 20.6 s; `CalcFBHourglassForceForElems` 8% → 39% of samples |
+| LULESH load imbalance (`-s 90 -i 100 -b 0 -c 0`) | wall 26.6 → 37.4 s; `CalcFBHourglassForceForElems` 9% → 19% of samples |
+| LULESH memory-bound (same settings) | wall 26.6 → 41.3 s; `CalcKinematicsForElems` 5% → 44% of samples |
 | CoMD load imbalance | rank 0 spends 11.7 s in `force` vs 9.3 s for the fastest rank; the other ranks wait up to 2.4 s in the halo exchange (rank 0: 0.2 s) |
 | CoMD memory-bound | wall 16.0 → 24.1 s; the table lookup is the hottest source line of `ljForce` (30% of samples) |
 
@@ -468,6 +494,19 @@ cases:
       bottleneck_types: [load_imbalance]   # any of these counts as the right diagnosis
 ```
 
+Two optional keys apply to reference-based suites like LULESH's:
+
+```yaml
+run: "{binary} -s 90 -i 100 -b 0 -c 0"   # replaces the config's run command for every case
+cases:
+  - id: negative-control
+    expect: none
+    reference: {file: references/lulesh-afzal2024.yaml, variant: openmp}   # unmodified cases only
+```
+
+A reference file names its source and URL. Under `variants`, it maps each function to `class:
+memory_bound` or `class: not_memory_bound`, optionally with the measured `intensity`.
+
 The suite is validated before anything runs, and all problems are reported together: keys,
 ids, patch paths, bottleneck types from the findings schema, the target config, and an MPI case
 without an MPI config.
@@ -481,20 +520,32 @@ For each case, `results.json` records:
   types. That finding's rank is recorded.
 - **false positives:** findings that report one of the suite's injected bottleneck types for an
   injection site (a function the suite's patches change), in a case that did not inject that type
-  there. A natural finding in another function is not a false positive. For example, LULESH's
-  OpenMP runtime spin-waits even when unmodified, and a "load imbalance in libgomp" finding there
-  is not counted.
+  there. Two kinds of finding are never false positives:
+  - a natural finding in another function. For example, LULESH's OpenMP runtime spin-waits even
+    when unmodified, and a "load imbalance in libgomp" finding is not counted.
+  - a finding that agrees with the reference classification, such as
+    `CalcFBHourglassForceForElems` reported as memory-bound in the unmodified case.
+- **reference agreement** (cases with a `reference`): for each reference function the agent
+  reports, its class is compared with the reference's. The class is taken from the agent's
+  best-ranked finding for that function:
+  - `memory_latency_bound` and `memory_bandwidth_bound` count as memory-bound.
+  - `compute_bound`, `poor_vectorization` and `branch_misprediction` count as not memory-bound.
+  - Other types, such as `load_imbalance`, make no roofline claim and count as a disagreement.
+
+  The results list each function as agrees, disagrees or not reported.
 - **time:** wall-clock time for the case, including the build and all profiling.
 - **experiments:** how many experiment artifact sets the agent created, and their names.
 - the run's exit status, whether `findings.json` was valid, and every finding's rank, function,
   type and confidence.
 
 A case is **correct** when the run succeeded with valid findings, the injected function and type
-were found (not required for a negative control), and there are no false positives. An
-inconclusive result on an injected case counts as a miss.
+were found (not required for a negative control), and there are no false positives. For a case
+with a reference, the agent must also report at least one reference function, and every one it
+reports must agree. An inconclusive result on an injected case counts as a miss.
 
-`results.json` holds every case plus a summary: cases correct, functions and types found, cases
-with false positives, total experiments and total time. `results.md` presents the same as a table,
+`results.json` holds every case plus a summary: cases correct, functions and types found,
+reference functions reported and agreeing, cases with false positives, total experiments and total
+time. `results.md` presents the same as a table,
 plus each case's reported findings. Both are rewritten after every case, so an interrupted suite
 keeps its results.
 
