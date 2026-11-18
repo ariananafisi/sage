@@ -1,0 +1,30 @@
+# Reference classification of LULESH's hot functions, used by suites/lulesh.yaml to score the agent.
+# The agent never sees this file (the suite directory is hidden from it during an eval).
+source: >-
+  A. Afzal, G. Hager, G. Wellein, "Analytic Roofline Modeling and Energy Analysis of LULESH Proxy
+  Application on Multi-Core Clusters", arXiv:2412.08792, 2024
+url: https://arxiv.org/abs/2412.08792
+measured_on: >-
+  Intel Xeon Platinum 8360Y (Ice Lake) and 8470 (Sapphire Rapids), one ccNUMA domain (18 / 13 cores),
+  Intel compiler 2023 -O3 -xCORE-AVX512, LIKWID MEM and DP counter groups, validated against an
+  analytic Roofline model (Table III, Sections IV-V).
+settings: >-
+  LULESH 2.0, load imbalance off (-b 0 -c 0), -i 300, domain 60^3 to 350^3 (OpenMP) and 60^3 to 150^3
+  per process (MPI); working sets at least 10x the last-level cache.
+# class: memory_bound or not_memory_bound. intensity: measured single-threaded computational intensity
+# on Ice Lake in flop/byte (Table III, OMP-ICL); recorded for reference, not used in scoring.
+variants:
+  openmp:
+    CalcHourglassControlForElems: {class: memory_bound, intensity: 0.28}
+    CalcFBHourglassForceForElems: {class: memory_bound, intensity: 1.39}
+    IntegrateStressForElems: {class: memory_bound, intensity: 2.07}
+    CalcKinematicsForElems: {class: not_memory_bound}
+    CalcMonotonicQGradientsForElems: {class: memory_bound, intensity: 0.69}
+    EvalEOSForElems: {class: memory_bound, intensity: 0.1}
+  mpi:
+    CalcHourglassControlForElems: {class: memory_bound, intensity: 0.28}
+    CalcFBHourglassForceForElems: {class: memory_bound, intensity: 1.39}
+    IntegrateStressForElems: {class: not_memory_bound, intensity: 2.08}
+    CalcKinematicsForElems: {class: not_memory_bound}
+    CalcMonotonicQGradientsForElems: {class: memory_bound, intensity: 0.69}
+    EvalEOSForElems: {class: memory_bound, intensity: 0.1}

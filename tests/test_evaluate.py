@@ -13,7 +13,8 @@ import pytest
 import yaml
 
 from sage import agent, evaluate
-from sage.evaluate import Case, Expect, SuiteError, function_matches, load_suite, score, summarize
+from sage.evaluate import (Case, Expect, SuiteError, function_matches, load_reference, load_suite, score,
+                           score_reference, summarize)
 
 REPO = Path(__file__).resolve().parent.parent
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "eval"
@@ -46,8 +47,9 @@ def test_shipped_suites_are_valid(target):
     assert set(kinds["negative-control"].false_positive_types) == {"load_imbalance", *MEMORY}
     assert kinds["load-imbalance"].expect.bottleneck_types == ("load_imbalance",)
     assert set(kinds["memory-bound"].expect.bottleneck_types) == set(MEMORY)
-    site = {"lulesh": "CalcFBHourglassForceForElems", "comd": "ljForce"}[target]
-    assert all(c.injection_sites == (site,) for c in suite.cases)
+    sites = {"lulesh": ("CalcFBHourglassForceForElems", "CalcKinematicsForElems"), "comd": ("ljForce",)}[target]
+    assert all(c.injection_sites == sites for c in suite.cases)
+    assert all(c.expect.function in sites for c in suite.cases if c.expect)
     assert kinds["load-imbalance"].mpi == (target == "comd") == kinds["negative-control"].mpi
     for case in (kinds["load-imbalance"], kinds["memory-bound"]):
         assert case.patch.is_file() and case.patch.suffix == ".patch"
@@ -218,7 +220,8 @@ def test_summarize_and_markdown(tmp_path):
     ]
     s = summarize(cases)
     assert s == {"cases": 3, "correct": 1, "completed": 2, "errors": 1, "injected_cases": 2, "function_found": 1,
-                 "type_found": 1, "negative_controls": 1, "cases_with_false_positives": 1, "false_positives": 1,
+                 "type_found": 1, "negative_controls": 1, "reference_functions": 0, "reference_reported": 0,
+                 "reference_agreed": 0, "cases_with_false_positives": 1, "false_positives": 1,
                  "experiments": 1, "total_duration_s": 300.0}
     md = evaluate.render_markdown({"suite": "lulesh", "target": "lulesh", "model": "gpt-5", "started_at": "t",
                                    "suite_path": "suites/lulesh.yaml", "cases": cases, "summary": s})
@@ -416,3 +419,119 @@ def test_cli_eval_errors(cli, tmp_path, capsys):
         agent.main(["eval", "--suite", str(REPO / "suites/comd.yaml"), "--out", "taken"])
     assert "already exists" in capsys.readouterr().err
     assert not cli
+
+
+# --- reference classification (e.g. a published roofline study) ----------------------------------
+
+def test_shipped_lulesh_reference():
+    suite = load_suite(REPO / "suites" / "lulesh.yaml")
+    assert suite.run == "{binary} -s 90 -i 100 -b 0 -c 0"
+    control = {c.id: c for c in suite.cases}["negative-control"]
+    ref = control.reference
+    assert ref.variant == "openmp" and "2412.08792" in ref.url and ref.path.parent.name == "references"
+    classes = dict(ref.classes)
+    assert len(classes) == 6 and classes["CalcKinematicsForElems"] == "not_memory_bound"
+    assert sum(c == "memory_bound" for c in classes.values()) == 5
+    mpi, _ = load_reference(ref.path, "mpi")
+    assert dict(mpi.classes)["IntegrateStressForElems"] == "not_memory_bound"
+    # the memory-bound injection targets the one hot spot the reference finds not memory-bound
+    assert {c.id: c for c in suite.cases}["memory-bound"].expect.function == "CalcKinematicsForElems"
+
+
+REF, _ = load_reference(FIXTURES / "references" / "roofline.yaml", "openmp")
+REF_CASE = Case(id="negative-control", description="", patch=None, mpi=False, expect=None,
+                false_positive_types=("load_imbalance", *MEMORY),
+                injection_sites=("CalcFBHourglassForceForElems", "CalcKinematicsForElems"), reference=REF)
+
+
+def test_score_reference_rows():
+    result = score_reference(REF, fixture("reference-diagnosis.json")["findings"])
+    rows = {r["function"]: r for r in result["functions"]}
+    assert rows["CalcFBHourglassForceForElems"] == {
+        "function": "CalcFBHourglassForceForElems", "reference_class": "memory_bound", "reported": True, "rank": 1,
+        "agent_type": "memory_bandwidth_bound", "agent_class": "memory_bound", "agrees": True}
+    assert rows["CalcKinematicsForElems"]["agent_class"] == "memory_bound" and rows["CalcKinematicsForElems"]["agrees"] is False
+    assert rows["CalcHourglassControlForElems"]["reported"] is False and rows["CalcHourglassControlForElems"]["agrees"] is None
+    assert (result["total"], result["reported"], result["agreed"]) == (3, 2, 1)
+
+
+@pytest.mark.parametrize("bottleneck_type,agent_class,agrees", [
+    ("memory_latency_bound", "memory_bound", True), ("memory_bandwidth_bound", "memory_bound", True),
+    ("compute_bound", "not_memory_bound", False), ("poor_vectorization", "not_memory_bound", False),
+    ("branch_misprediction", "not_memory_bound", False), ("load_imbalance", None, False), ("other", None, False),
+])
+def test_bottleneck_types_map_to_roofline_classes(bottleneck_type, agent_class, agrees):
+    found = [{"rank": 1, "function": "CalcFBHourglassForceForElems", "bottleneck_type": bottleneck_type}]
+    row = score_reference(REF, found)["functions"][1]
+    assert (row["agent_class"], row["agrees"]) == (agent_class, agrees)
+
+
+def test_reference_case_scoring(tmp_path):
+    result = score(REF_CASE, fixture("reference-diagnosis.json"), agent.OK, run_dir_with(tmp_path), 10)
+    assert result["reference"]["agreed"] == 1 and result["reference"]["reported"] == 2
+    # rank 1 (memory-bound in an injection site) agrees with the reference: not a false positive;
+    # rank 2 (memory-bound in CalcKinematicsForElems) contradicts it: a false positive
+    assert [f["rank"] for f in result["false_positives"]] == [2]
+    assert not result["correct"]
+
+
+def test_reference_case_correct_when_all_reported_functions_agree(tmp_path):
+    findings = fixture("reference-diagnosis.json")
+    findings["findings"][1]["bottleneck_type"] = "compute_bound"
+    result = score(REF_CASE, findings, agent.OK, run_dir_with(tmp_path), 10)
+    assert result["reference"]["agreed"] == result["reference"]["reported"] == 2
+    assert result["false_positives"] == [] and result["correct"]
+    nothing = score(REF_CASE, fixture("inconclusive.json"), agent.OK, run_dir_with(tmp_path), 10)
+    assert nothing["reference"]["reported"] == 0 and not nothing["correct"]  # reporting nothing is not agreement
+
+
+@pytest.mark.parametrize("content,variant,message", [
+    ("source: s\nurl: u\nvariants: {openmp: {f: {class: memory_bound}}}\n", "mpi", "no variant 'mpi'"),
+    ("source: s\nurl: u\nvariants: {openmp: {f: {class: fast}}}\n", "openmp", "f.class must be one of"),
+    ("source: s\nurl: u\nvariants: {openmp: {'f(int)': {class: memory_bound}}}\n", "openmp", "not a plain function name"),
+    ("url: u\nvariants: {openmp: {f: {class: memory_bound}}}\n", "openmp", "missing key 'source'"),
+    ("source: s\nurl: u\nvariants: {openmp: {}}\n", "openmp", "must map function names to classes"),
+    ("- a\n", "openmp", "top level must be a mapping"),
+])
+def test_invalid_reference(tmp_path, content, variant, message):
+    (tmp_path / "r.yaml").write_text(content)
+    ref, errors = load_reference(tmp_path / "r.yaml", variant)
+    assert ref is None and any(message in e for e in errors), errors
+    assert "reference file not found" in load_reference(tmp_path / "missing.yaml", "openmp")[1][0]
+
+
+@pytest.mark.parametrize("change,message", [
+    ({"run": "./lulesh -s 5"}, "run must be a command string using the {binary} placeholder"),
+    ({"cases": [{"id": "a", "expect": "none", "reference": {"file": "x.yaml"}}]},
+     "reference must have exactly 'file' and 'variant'"),
+    ({"cases": [{"id": "a", "expect": {"function": "f", "bottleneck_types": ["load_imbalance"]},
+                 "reference": {"file": "x.yaml", "variant": "openmp"}}]}, "reference applies to unmodified code"),
+    ({"cases": [{"id": "a", "expect": "none", "reference": {"file": "missing.yaml", "variant": "openmp"}}]},
+     "cases[0].reference file not found"),
+])
+def test_invalid_reference_in_suite(tmp_path, change, message):
+    with pytest.raises(SuiteError) as exc:
+        load_suite(write_suite(tmp_path, {**BASE, **change}))
+    assert message in str(exc.value)
+
+
+def test_reference_summary_and_markdown(tmp_path):
+    case = {"id": "negative-control", "run_id": "case-1", "patch": None, "expected": None, "run_dir": "r", "error": None,
+            **score(REF_CASE, fixture("reference-diagnosis.json"), agent.OK, run_dir_with(tmp_path), 10)}
+    s = summarize([case])
+    assert (s["reference_functions"], s["reference_reported"], s["reference_agreed"]) == (3, 2, 1)
+    md = evaluate.render_markdown({"suite": "lulesh", "target": "lulesh", "model": "m", "started_at": "t",
+                                   "suite_path": "p", "cases": [case], "summary": s})
+    assert "Reference classification: 1 of 2 reported hot functions agree (2 of 3 reported)." in md
+    assert "| negative-control (case-1) | none | reference: 1 of 2 agree |" in md
+    assert "Compared with Fixture study (https://example.invalid/paper), variant `openmp`:" in md
+    assert "| `CalcFBHourglassForceForElems` | memory bound | rank 1: memory_bandwidth_bound | memory bound | yes |" in md
+    assert "| `CalcHourglassControlForElems` | memory bound | not reported | - | n/a |" in md
+    assert "| `CalcKinematicsForElems` | not memory bound | rank 2: memory_latency_bound | memory bound | no |" in md
+
+
+def test_suite_run_command_reaches_the_case_config(tmp_path, harness):
+    suite = load_suite(FIXTURES / "suite.yaml")
+    suite = evaluate.Suite(**{**suite.__dict__, "run": "{binary} -s 7 -b 0"})
+    evaluate.run_suite(suite, tmp_path / "out", tmp_path, None, agent.Limits(), "u", only=["negative-control"])
+    assert yaml.safe_load(Path(harness[0]["config"]).read_text())["run"] == "{binary} -s 7 -b 0"

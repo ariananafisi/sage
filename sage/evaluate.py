@@ -1,7 +1,8 @@
-"""bottleneck-agent eval: run the agent on cases with known, injected bottlenecks and score its diagnosis.
+"""bottleneck-agent eval: run the agent on cases with known bottlenecks and score its diagnosis.
 
 A suite YAML names a target and its cases. Each case is the pinned upstream source, optionally
-changed by a patch file, and says what the agent should find. Every case runs on a fresh copy of
+changed by a patch file, and says what the agent should find: an injected bottleneck, or, for an
+unmodified case, a published reference classification of the hot functions (e.g. a roofline study). Every case runs on a fresh copy of
 the source, under an opaque id (case-1, case-2, ...), so neither the paths nor the source history
 tell the agent what was injected. Results go to <out>/results.json and <out>/results.md.
 """
@@ -21,13 +22,19 @@ from pathlib import Path
 import yaml
 
 from . import agent
-from .config import TARGETS, ConfigError, load_config
+from .config import TARGETS, ConfigError, load_config, placeholders
 from .findings import SCHEMA, FindingsError, load as load_findings
 from .guard import HIDDEN_REASON
 
 BOTTLENECK_TYPES = SCHEMA["definitions"]["finding"]["properties"]["bottleneck_type"]["enum"]
 CASE_ID = re.compile(r"[a-z0-9][a-z0-9-]*")
 STATUS_NAMES = {0: "ok", 1: "failed", 3: "source modified", 4: "invalid findings", 5: "timed out"}
+REFERENCE_CLASSES = ("memory_bound", "not_memory_bound")
+# How a finding's bottleneck type maps onto a roofline classification. Types that say nothing about
+# memory versus in-core limits (load imbalance, synchronization, ...) map to None: no classification.
+ROOFLINE_CLASS = {"memory_latency_bound": "memory_bound", "memory_bandwidth_bound": "memory_bound",
+                  "compute_bound": "not_memory_bound", "poor_vectorization": "not_memory_bound",
+                  "branch_misprediction": "not_memory_bound"}
 
 
 class SuiteError(Exception):
@@ -41,6 +48,16 @@ class Expect:
 
 
 @dataclass(frozen=True)
+class Reference:
+    """A published classification of an unmodified application's hot functions."""
+    source: str
+    url: str
+    variant: str
+    classes: tuple[tuple[str, str], ...]  # (function, memory_bound | not_memory_bound), in the source's order
+    path: Path
+
+
+@dataclass(frozen=True)
 class Case:
     id: str
     description: str
@@ -49,6 +66,7 @@ class Case:
     expect: Expect | None  # None: a negative control, nothing was injected
     false_positive_types: tuple[str, ...]  # findings of these types count as false positives ...
     injection_sites: tuple[str, ...] = ()  # ... if they name one of these functions (empty: any function)
+    reference: Reference | None = None  # unmodified cases only: score against a published classification
 
 
 @dataclass(frozen=True)
@@ -58,6 +76,39 @@ class Suite:
     config: Path
     cases: tuple[Case, ...]
     path: Path
+    run: str | None = None  # replaces the config's run command for every case ("{binary} ...")
+
+
+def load_reference(path: Path, variant: str) -> tuple[Reference | None, list[str]]:
+    """Read a reference file; returns the reference for ``variant``, or the problems found."""
+    try:
+        data = yaml.safe_load(Path(path).read_text())
+    except FileNotFoundError:
+        return None, [f"reference file not found: {path}"]
+    except (OSError, yaml.YAMLError) as e:
+        return None, [f"cannot read reference {path}: {e}"]
+    if not isinstance(data, dict):
+        return None, [f"reference {path}: top level must be a mapping"]
+    errors = [f"reference {path}: missing key '{k}'" for k in ("source", "url", "variants") if k not in data]
+    variants = data.get("variants")
+    if not isinstance(variants, dict) or variant not in variants:
+        return None, errors + [f"reference {path}: no variant '{variant}' under 'variants'"]
+    functions = variants[variant]
+    if not isinstance(functions, dict) or not functions:
+        return None, errors + [f"reference {path}: variant '{variant}' must map function names to classes"]
+    classes = []
+    for fn, entry in functions.items():
+        cls = entry.get("class") if isinstance(entry, dict) else None
+        if not re.fullmatch(r"[A-Za-z_]\w*", str(fn)):
+            errors.append(f"reference {path}: '{fn}' is not a plain function name")
+        elif cls not in REFERENCE_CLASSES:
+            errors.append(f"reference {path}: {fn}.class must be one of {', '.join(REFERENCE_CLASSES)}, got {cls!r}")
+        else:
+            classes.append((fn, cls))
+    if errors:
+        return None, errors
+    return Reference(source=str(data["source"]), url=str(data["url"]), variant=variant, classes=tuple(classes),
+                     path=Path(path).resolve()), []
 
 
 def load_suite(path: Path) -> Suite:
@@ -74,7 +125,7 @@ def load_suite(path: Path) -> Suite:
     errors = [f"missing required key '{k}'" for k in ("name", "target", "config", "cases") if k not in data]
     errors += [f"unknown key '{k}'" for k in data
                if k not in ("name", "target", "config", "cases", "description", "false_positive_types",
-                            "injection_sites")]
+                            "injection_sites", "run")]
     base = path.parent
     name, target = data.get("name"), data.get("target")
     if "name" in data and not (isinstance(name, str) and CASE_ID.fullmatch(name)):
@@ -96,6 +147,10 @@ def load_suite(path: Path) -> Suite:
         errors.append("injection_sites must be a list of plain function names")
         sites = []
 
+    suite_run = data.get("run")
+    if suite_run is not None and placeholders(suite_run) != {"binary"}:
+        errors.append("run must be a command string using the {binary} placeholder and no other {…} fields")
+
     cases, seen = [], set()
     if "cases" in data and (not isinstance(data["cases"], list) or not data["cases"]):
         errors.append("cases must be a non-empty list")
@@ -105,7 +160,7 @@ def load_suite(path: Path) -> Suite:
             errors.append(f"{where} must be a mapping")
             continue
         errors += [f"{where}: unknown key '{k}'" for k in raw
-                   if k not in ("id", "description", "patch", "mpi", "expect", "false_positive_types")]
+                   if k not in ("id", "description", "patch", "mpi", "expect", "false_positive_types", "reference")]
         cid = raw.get("id")
         if not (isinstance(cid, str) and CASE_ID.fullmatch(cid)):
             errors.append(f"{where}.id must be lowercase letters, digits and '-', got {cid!r}")
@@ -137,6 +192,16 @@ def load_suite(path: Path) -> Suite:
                 errors += _check_types(types, f"{where}.expect.bottleneck_types", required=True)
                 if not errors:
                     expect = Expect(function=e["function"], bottleneck_types=tuple(types))
+        reference = None
+        if "reference" in raw:
+            r = raw["reference"]
+            if not isinstance(r, dict) or set(r) != {"file", "variant"}:
+                errors.append(f"{where}.reference must have exactly 'file' and 'variant'")
+            elif raw.get("expect") != "none" or patch is not None:
+                errors.append(f"{where}.reference applies to unmodified code: it needs 'expect: none' and no patch")
+            else:
+                reference, problems = load_reference(base / str(r["file"]), str(r["variant"]))
+                errors += [f"{where}.{e}" for e in problems]
         if expect is None and raw.get("expect") != "none":
             continue
         fp = raw.get("false_positive_types", default_fp)
@@ -145,11 +210,12 @@ def load_suite(path: Path) -> Suite:
             errors.append(f"{where}: a type cannot be both expected and a false positive")
         if isinstance(fp, list) and isinstance(cid, str):
             cases.append(Case(id=cid, description=str(raw.get("description", "")), patch=patch, mpi=bool(mpi),
-                              expect=expect, injection_sites=tuple(sites),
+                              expect=expect, injection_sites=tuple(sites), reference=reference,
                               false_positive_types=tuple(t for t in fp if not expect or t not in expect.bottleneck_types)))
     if errors:
         raise SuiteError(f"invalid suite {path}:\n" + "\n".join(f"  - {e}" for e in errors))
-    return Suite(name=name, target=target, config=(base / data["config"]).resolve(), cases=tuple(cases), path=path)
+    return Suite(name=name, target=target, config=(base / data["config"]).resolve(), cases=tuple(cases), path=path,
+                 run=suite_run)
 
 
 def _check_types(value, where: str, required: bool = False) -> list[str]:
@@ -188,14 +254,45 @@ def score(case: Case, findings: dict | None, status: int, run_dir: Path, duratio
         result["function_found"] = bool(hits)
         result["type_found"] = bool(right)
         result["matched_rank"] = min(f["rank"] for f in right) if right else None
+    result["reference"] = score_reference(case.reference, found) if case.reference else None
     result["false_positives"] = [{"rank": f["rank"], "function": f["function"], "bottleneck_type": f["bottleneck_type"]}
                                  for f in sorted(found, key=lambda f: f["rank"])
                                  if f["bottleneck_type"] in case.false_positive_types
                                  and (not case.injection_sites
-                                      or any(function_matches(f["function"], site) for site in case.injection_sites))]
+                                      or any(function_matches(f["function"], site) for site in case.injection_sites))
+                                 and not agrees_with_reference(case.reference, f)]
+    reference_ok = (case.reference is None
+                    or (result["reference"]["reported"] > 0
+                        and result["reference"]["agreed"] == result["reference"]["reported"]))
     result["correct"] = (findings is not None and status == agent.OK and not result["false_positives"]
-                         and (case.expect is None or result["type_found"]))
+                         and (case.expect is None or result["type_found"]) and reference_ok)
     return result
+
+
+def score_reference(reference: Reference, found: list[dict]) -> dict:
+    """Compare the agent's classification of each reference function with the reference's.
+
+    A function counts as reported if a finding names it; its class comes from the best-ranked such
+    finding. A type with no roofline meaning (e.g. load_imbalance) disagrees with either class.
+    """
+    rows = []
+    for function, cls in reference.classes:
+        hits = sorted((f for f in found if function_matches(f["function"], function)), key=lambda f: f["rank"])
+        agent_type = hits[0]["bottleneck_type"] if hits else None
+        agent_class = ROOFLINE_CLASS.get(agent_type) if agent_type else None
+        rows.append({"function": function, "reference_class": cls, "reported": bool(hits),
+                     "rank": hits[0]["rank"] if hits else None, "agent_type": agent_type,
+                     "agent_class": agent_class, "agrees": (agent_class == cls) if hits else None})
+    return {"source": reference.source, "url": reference.url, "variant": reference.variant, "functions": rows,
+            "total": len(rows), "reported": sum(r["reported"] for r in rows),
+            "agreed": sum(bool(r["agrees"]) for r in rows)}
+
+
+def agrees_with_reference(reference: Reference | None, finding: dict) -> bool:
+    if reference is None:
+        return False
+    cls = ROOFLINE_CLASS.get(finding["bottleneck_type"])
+    return any(function_matches(finding["function"], fn) and cls == ref_cls for fn, ref_cls in reference.classes)
 
 
 def summarize(cases: list[dict]) -> dict:
@@ -211,6 +308,9 @@ def summarize(cases: list[dict]) -> dict:
         "function_found": sum(bool(c.get("function_found")) for c in injected),
         "type_found": sum(bool(c.get("type_found")) for c in injected),
         "negative_controls": len(controls),
+        "reference_functions": sum(c["reference"]["total"] for c in cases if c.get("reference")),
+        "reference_reported": sum(c["reference"]["reported"] for c in cases if c.get("reference")),
+        "reference_agreed": sum(c["reference"]["agreed"] for c in cases if c.get("reference")),
         "cases_with_false_positives": sum(bool(c.get("false_positives")) for c in cases),
         "false_positives": sum(len(c.get("false_positives") or []) for c in cases),
         "experiments": sum(c.get("experiments") or 0 for c in cases),
@@ -226,12 +326,17 @@ def render_markdown(results: dict) -> str:
            f"**{s['correct']} of {s['cases']} cases correct.** Injected bottlenecks: function found in "
            f"{s['function_found']} of {s['injected_cases']}, function and type found in {s['type_found']} of "
            f"{s['injected_cases']}. Cases with false positives: {s['cases_with_false_positives']}. "
-           f"{s['experiments']} experiment run(s), {s['total_duration_s']:g} s in total.", "",
+           f"{s['experiments']} experiment run(s), {s['total_duration_s']:g} s in total."
+           + (f" Reference classification: {s['reference_agreed']} of {s['reference_reported']} reported hot "
+              f"functions agree ({s['reference_reported']} of {s['reference_functions']} reported)."
+              if s.get("reference_functions") else ""), "",
            "| Case | Injected | Expected | Status | Function found | Type found | False positives | Experiments | Time (s) | Correct |",
            "| --- | --- | --- | --- | --- | --- | --- | ---: | ---: | --- |"]
     for c in results["cases"]:
         expected = (f"`{c['expected']['function']}`: {' or '.join(c['expected']['bottleneck_types'])}"
-                    if c.get("expected") else "nothing (negative control)")
+                    if c.get("expected") else
+                    f"reference: {c['reference']['agreed']} of {c['reference']['reported']} agree"
+                    if c.get("reference") else "nothing (negative control)")
         fps = ", ".join(f"{f['function']} ({f['bottleneck_type']})" for f in c.get("false_positives") or []) or "none"
         out.append(f"| {c['id']} ({c['run_id']}) | {c['patch'] or 'none'} | {expected} | "
                    f"{c.get('status', 'error')} | {yes(c.get('function_found'))} | {yes(c.get('type_found'))} | "
@@ -242,6 +347,17 @@ def render_markdown(results: dict) -> str:
         out += [f"## {c['id']}", "", c.get("description") or "", ""]
         if c.get("error"):
             out += [f"Error: `{c['error']}`", ""]
+        if c.get("reference"):
+            ref = c["reference"]
+            out += [f"Compared with {ref['source']} ({ref['url']}), variant `{ref['variant']}`:", "",
+                    "| Function | Reference | Agent's finding | Agent's class | Agrees |",
+                    "| --- | --- | --- | --- | --- |"]
+            for row in ref["functions"]:
+                finding = f"rank {row['rank']}: {row['agent_type']}" if row["reported"] else "not reported"
+                out.append(f"| `{row['function']}` | {row['reference_class'].replace('_', ' ')} | {finding} | "
+                           f"{(row['agent_class'] or 'no roofline class').replace('_', ' ') if row['reported'] else '-'} | "
+                           f"{yes(row['agrees'])} |")
+            out.append("")
         if c.get("findings"):
             out += ["Reported findings:", ""] + [f"{f['rank']}. `{f['function']}`: {f['bottleneck_type']} "
                                                   f"({f['confidence']} confidence)" for f in c["findings"]] + [""]
@@ -302,7 +418,9 @@ def run_case(suite: Suite, case: Case, run_id: str, case_dir: Path, root: Path, 
     cache = pinned_cache(root, cfg.repo_url, cfg.commit)
     commit = prepare_source(cache, cfg.commit, cfg.repo_url, case.patch, case_dir / ".work" / suite.target / "src")
     raw = yaml.safe_load(suite.config.read_text())
-    raw["commit"] = commit  # the case's own source: pinned + patch, verified by the source check
+    raw["commit"] = commit
+    if suite.run:  # e.g. the settings a reference study used
+        (raw["mpi"] if case.mpi else raw)["run"] = suite.run  # the case's own source: pinned + patch, verified by the source check
     config_path = case_dir / "config.yaml"
     config_path.write_text(yaml.safe_dump(raw, sort_keys=False))
     case_cfg = load_config(config_path, suite.target)

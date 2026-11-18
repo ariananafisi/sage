@@ -1,0 +1,9 @@
+source: Fixture study
+url: https://example.invalid/paper
+variants:
+  openmp:
+    CalcHourglassControlForElems: {class: memory_bound, intensity: 0.28}
+    CalcFBHourglassForceForElems: {class: memory_bound, intensity: 1.39}
+    CalcKinematicsForElems: {class: not_memory_bound}
+  mpi:
+    CalcKinematicsForElems: {class: not_memory_bound}
