@@ -16,6 +16,7 @@ Commands:
   annotate:           {{annotate_command}}
   experiment:         {{experiment_command}}
   annotate experiment: {{annotate_experiment_command}}
+  compare:            {{compare_command}}
   validate findings:  {{validate_command}}
 
 In the experiment command, <name> names the experiment's directory under experiments/. Use a

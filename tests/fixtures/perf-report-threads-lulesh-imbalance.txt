@@ -1,0 +1,70 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 464K of event 'task-clock:ppp'
+# Event count (approx.): 116093750000
+#
+# Overhead      Pid:Command    Shared Object         Symbol                                                                                                                                                                                                                                             
+# ........  .................  ....................  ...................................................................................................................................................................................................................................................
+#
+    13.55%     1426:lulesh2.0  lulesh2.0             [.] CalcFBHourglassForceForElems(Domain&, double*, double*, double*, double*, double*, double*, double*, double, int, int) [clone ._omp_fn.0]
+     2.43%     1426:lulesh2.0  libgomp.so.1.0.0      [.] 0x00000000000258a2
+     2.27%     1428:lulesh2.0  libgomp.so.1.0.0      [.] 0x00000000000258a2
+     2.19%     1429:lulesh2.0  libgomp.so.1.0.0      [.] 0x00000000000258a2
+     2.16%     1426:lulesh2.0  [kernel.kallsyms]     [k] _raw_spin_unlock_irqrestore
+     2.12%     1430:lulesh2.0  libgomp.so.1.0.0      [.] 0x00000000000258a2
+     1.83%     1428:lulesh2.0  lulesh2.0             [.] CalcFBHourglassForceForElems(Domain&, double*, double*, double*, double*, double*, double*, double*, double, int, int) [clone ._omp_fn.0]
+     1.81%     1430:lulesh2.0  [kernel.kallsyms]     [k] exc_page_fault
+     1.78%     1429:lulesh2.0  lulesh2.0             [.] CalcFBHourglassForceForElems(Domain&, double*, double*, double*, double*, double*, double*, double*, double, int, int) [clone ._omp_fn.0]
+     1.77%     1430:lulesh2.0  lulesh2.0             [.] CalcFBHourglassForceForElems(Domain&, double*, double*, double*, double*, double*, double*, double*, double, int, int) [clone ._omp_fn.0]
+     1.76%     1428:lulesh2.0  [kernel.kallsyms]     [k] exc_page_fault
+     1.75%     1426:lulesh2.0  [kernel.kallsyms]     [k] exc_page_fault
+     1.74%     1429:lulesh2.0  [kernel.kallsyms]     [k] exc_page_fault
+     1.45%     1430:lulesh2.0  libgomp.so.1.0.0      [.] 0x00000000000256c2
+     1.43%     1428:lulesh2.0  libgomp.so.1.0.0      [.] 0x00000000000256c2
+     1.42%     1429:lulesh2.0  libgomp.so.1.0.0      [.] 0x00000000000256c2
+     1.18%     1430:lulesh2.0  lulesh2.0             [.] CalcHourglassControlForElems(Domain&, double*, double) [clone ._omp_fn.0]
+     1.18%     1428:lulesh2.0  lulesh2.0             [.] CalcHourglassControlForElems(Domain&, double*, double) [clone ._omp_fn.0]
+     1.16%     1429:lulesh2.0  lulesh2.0             [.] CalcHourglassControlForElems(Domain&, double*, double) [clone ._omp_fn.0]
+     1.14%     1430:lulesh2.0  lulesh2.0             [.] CalcKinematicsForElems(Domain&, double, int) [clone ._omp_fn.0]
+     1.12%     1428:lulesh2.0  lulesh2.0             [.] CalcKinematicsForElems(Domain&, double, int) [clone ._omp_fn.0]
+     1.12%     1429:lulesh2.0  lulesh2.0             [.] CalcKinematicsForElems(Domain&, double, int) [clone ._omp_fn.0]
+     1.10%     1426:lulesh2.0  lulesh2.0             [.] CalcHourglassControlForElems(Domain&, double*, double) [clone ._omp_fn.0]
+     1.06%     1426:lulesh2.0  lulesh2.0             [.] CalcKinematicsForElems(Domain&, double, int) [clone ._omp_fn.0]
+     1.00%     1426:lulesh2.0  [kernel.kallsyms]     [k] _raw_spin_lock
+     0.98%     1429:lulesh2.0  [kernel.kallsyms]     [k] _raw_spin_lock
+     0.96%     1428:lulesh2.0  [kernel.kallsyms]     [k] _raw_spin_lock
+     0.95%     1430:lulesh2.0  lulesh2.0             [.] IntegrateStressForElems(Domain&, double*, double*, double*, double*, int, int) [clone ._omp_fn.0]
+     0.95%     1430:lulesh2.0  [kernel.kallsyms]     [k] _raw_spin_lock
+     0.94%     1429:lulesh2.0  lulesh2.0             [.] IntegrateStressForElems(Domain&, double*, double*, double*, double*, int, int) [clone ._omp_fn.0]
+     0.92%     1428:lulesh2.0  lulesh2.0             [.] IntegrateStressForElems(Domain&, double*, double*, double*, double*, int, int) [clone ._omp_fn.0]
+     0.91%     1426:lulesh2.0  lulesh2.0             [.] IntegrateStressForElems(Domain&, double*, double*, double*, double*, int, int) [clone ._omp_fn.0]
+     0.89%     1429:lulesh2.0  [kernel.kallsyms]     [k] memcg1_commit_charge
+     0.89%     1430:lulesh2.0  [kernel.kallsyms]     [k] memcg1_commit_charge
+     0.86%     1428:lulesh2.0  [kernel.kallsyms]     [k] memcg1_commit_charge
+     0.83%     1426:lulesh2.0  [kernel.kallsyms]     [k] memcg1_commit_charge
+     0.75%     1428:lulesh2.0  lulesh2.0             [.] CalcMonotonicQGradientsForElems(Domain&) [clone ._omp_fn.0]
+     0.75%     1430:lulesh2.0  lulesh2.0             [.] CalcMonotonicQGradientsForElems(Domain&) [clone ._omp_fn.0]
+     0.74%     1429:lulesh2.0  lulesh2.0             [.] CalcMonotonicQGradientsForElems(Domain&) [clone ._omp_fn.0]
+     0.69%     1426:lulesh2.0  lulesh2.0             [.] CalcMonotonicQGradientsForElems(Domain&) [clone ._omp_fn.0]
+     0.67%     1426:lulesh2.0  [kernel.kallsyms]     [k] unmap_page_range
+     0.62%     1428:lulesh2.0  lulesh2.0             [.] CalcFBHourglassForceForElems(Domain&, double*, double*, double*, double*, double*, double*, double*, double, int, int) [clone ._omp_fn.1]
+     0.62%     1429:lulesh2.0  lulesh2.0             [.] CalcFBHourglassForceForElems(Domain&, double*, double*, double*, double*, double*, double*, double*, double, int, int) [clone ._omp_fn.1]
+     0.62%     1430:lulesh2.0  lulesh2.0             [.] CalcFBHourglassForceForElems(Domain&, double*, double*, double*, double*, double*, double*, double*, double, int, int) [clone ._omp_fn.1]
+     0.58%     1428:lulesh2.0  lulesh2.0             [.] IntegrateStressForElems(Domain&, double*, double*, double*, double*, int, int) [clone ._omp_fn.1]
+     0.58%     1426:lulesh2.0  lulesh2.0             [.] CalcFBHourglassForceForElems(Domain&, double*, double*, double*, double*, double*, double*, double*, double, int, int) [clone ._omp_fn.1]
+     0.58%     1429:lulesh2.0  lulesh2.0             [.] IntegrateStressForElems(Domain&, double*, double*, double*, double*, int, int) [clone ._omp_fn.1]
+     0.57%     1430:lulesh2.0  lulesh2.0             [.] IntegrateStressForElems(Domain&, double*, double*, double*, double*, int, int) [clone ._omp_fn.1]
+     0.56%     1426:lulesh2.0  lulesh2.0             [.] IntegrateStressForElems(Domain&, double*, double*, double*, double*, int, int) [clone ._omp_fn.1]
+     0.56%     1429:lulesh2.0  [kernel.kallsyms]     [k] _raw_spin_unlock_irqrestore
+     0.55%     1428:lulesh2.0  [kernel.kallsyms]     [k] _raw_spin_unlock_irqrestore
+     0.55%     1430:lulesh2.0  [kernel.kallsyms]     [k] _raw_spin_unlock_irqrestore
+     0.52%     1430:lulesh2.0  lulesh2.0             [.] CalcMonotonicQRegionForElems(Domain&, int, double) [clone ._omp_fn.0]
+     0.50%     1429:lulesh2.0  lulesh2.0             [.] CalcMonotonicQRegionForElems(Domain&, int, double) [clone ._omp_fn.0]
+     0.48%     1428:lulesh2.0  lulesh2.0             [.] CalcMonotonicQRegionForElems(Domain&, int, double) [clone ._omp_fn.0]
+     0.47%     1426:lulesh2.0  lulesh2.0             [.] CalcMonotonicQRegionForElems(Domain&, int, double) [clone ._omp_fn.0]
+     0.42%     1429:lulesh2.0  [kernel.kallsyms]     [k] lock_vma_under_rcu
+     0.41%     1428:lulesh2.0  [kernel.kallsyms]     [k] lock_vma_under_rcu
+     0.40%     1429:lulesh2.0  lulesh2.0             [.] EvalEOSForElems(Domain&, double*, int, int*, int) [clone ._omp_fn.0]

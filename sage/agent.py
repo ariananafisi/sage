@@ -162,6 +162,8 @@ class Run:
                                   f"[--cmd '{{binary}} <arguments>'] [--env NAME=VALUE]",
             "annotate_experiment_command": f"{SCRIPTS}/annotate_symbol.sh <name> <symbol>{rank} "
                                            f"--runs {self.run_dir / 'experiments'}",
+            "compare_command": f"{sys.executable} -m sage.analysis compare baseline experiments/<name> "
+                               f"[--work <units in baseline> <units in experiment>] | tee compare-<name>.md",
             "validate_command": f"{sys.executable} -m sage.findings validate {self.run_dir}",
         }
 

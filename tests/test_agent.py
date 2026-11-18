@@ -69,12 +69,17 @@ def test_system_prompt_rules_tools_and_limits():
     flat = " ".join(text.split())
     assert "{{" not in text and "}}" not in text
     assert "Do not rely on prior knowledge of this application" in text
-    assert "Separate measured facts from inferences" in text and "`supporting_evidence` holds only measured facts" in text
+    assert "Separate measured facts from inferences" in text and "`supporting_evidence` holds only measured facts" in flat
+    # the diagnosis method: general measurements and decision rules, nothing application-specific
+    for rule in ("# Diagnosis method", "imbalance factor of about 1.3 or more", "working-set experiment",
+                 "per unit B/A", "about 0.7 or less", "about 0.85 to 1.15", "samples skid",
+                 "one per application function with at least 3% of self time", "Read baseline/summary.md first"):
+        assert rule in flat, rule
     assert "at most 2 experiment(s)" in text and "33 model calls and 30 minutes" in flat
     for step in ("1. **Preflight and build.**", "2. **Baseline.**", "3. **Inspect.**", "4. **Annotate and read source.**",
                  "5. **Hypothesis.**", "6. **Experiment.**", "7. **Findings.**"):
         assert step in text
-    assert "Change exactly one factor" in flat
+    assert "changing exactly one factor" in flat
     for tool in ("`bash`", "`read_file`", "`search`", "`write_findings`"):
         assert tool in text
     for stale in ("Write tool", "Grep/Read", "Edit or Write"):

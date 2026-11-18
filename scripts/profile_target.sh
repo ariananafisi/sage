@@ -7,6 +7,8 @@
 #   perf-stat.txt     perf stat -d, 3 repeats
 #   perf.data         perf record -g
 #   perf-report.txt   self time per DSO and symbol, highest first
+#   functions.json    each function's time per thread (or per MPI rank), with an imbalance factor
+#   summary.md        a readable digest of the above: start here
 # MPI (--ranks N) uses the config's mpi section: perf stat covers the whole job, and each rank
 # gets rank-<r>/perf.data and rank-<r>/perf-report.txt instead of the top-level pair.
 # The target must already be built (scripts/build_target.sh <target> [--mpi]).
@@ -127,7 +129,9 @@ echo "profile_target: $run_dir" >&2
 # --- 1. perf stat, 3 repeats ---
 stat_cmd="perf stat -r 3 -d -o $(q "$run_dir/perf-stat.txt") -- ${launcher:+$launcher }$run_cmd"
 echo "profile_target: perf stat (3 repeats)" >&2
-t=$(now); step "perf stat" "$stat_cmd"; rc=$?; stat_ns=$(( $(now) - t ))
+# The stat runs also record the peak memory of the largest process (the working set to compare with the cache).
+t=$(now); step "perf stat" "$(q "$PYTHON") -m sage.analysis maxrss $(q "$run_dir/.peak_rss_kb") -- $stat_cmd"; rc=$?
+stat_ns=$(( $(now) - t ))
 (( rc == 0 )) || fail "perf stat failed (exit $rc): the application or perf returned an error"
 grep -q "Performance counter stats" "$run_dir/perf-stat.txt" 2>/dev/null \
   || fail "perf stat exited 0 but wrote no counter statistics to perf-stat.txt"
@@ -170,4 +174,6 @@ else
 fi
 
 meta ok || die "could not write $run_dir/metadata.json"
-echo "profile_target: done: $run_dir (metadata.json, perf-stat.txt, ${ranks:+rank-*/}perf.data, ${ranks:+rank-*/}perf-report.txt, stdout.log, stderr.log)" >&2
+"$PYTHON" -m sage.analysis summary "$run_dir" >/dev/null 2>> "$run_dir/stderr.log" \
+  || fail "could not summarize the profile (per-function, per-thread breakdown)"
+echo "profile_target: done: $run_dir (summary.md, functions.json, metadata.json, perf-stat.txt, ${ranks:+rank-*/}perf.data, ${ranks:+rank-*/}perf-report.txt, stdout.log, stderr.log)" >&2

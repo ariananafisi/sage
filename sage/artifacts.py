@@ -160,6 +160,8 @@ def build_metadata(run_dir: Path, fields: dict, env: dict) -> dict:
 
     build_path = Path(fields["build_info"]) if fields.get("build_info") else None
     build = json.loads(build_path.read_text()) if build_path and build_path.is_file() else None
+    rss = run_dir / ".peak_rss_kb"
+    peak_rss_kb = int(rss.read_text().strip()) if rss.is_file() and rss.read_text().strip().isdigit() else None
     artifacts = [{"path": str(p.relative_to(run_dir)), "bytes": p.stat().st_size}
                  for p in sorted(run_dir.rglob("*")) if p.is_file() and p.name != "metadata.json"]
 
@@ -172,6 +174,7 @@ def build_metadata(run_dir: Path, fields: dict, env: dict) -> dict:
         "run_command": fields.get("run_command"),
         "env_overrides": dict(kv.split("=", 1) for kv in (fields.get("env_overrides") or "").splitlines() if "=" in kv),
         "mpi": {"ranks": ranks, "launcher": fields.get("launcher")} if ranks else None,
+        "peak_rss_mb": round(peak_rss_kb / 1024, 1) if peak_rss_kb else None,  # largest process, during perf stat
         "wall_clock": {
             "total_s": secs("total_ns"), "perf_stat_s": secs("stat_ns"), "perf_record_s": secs("record_ns"),
             "app_mean_s": stat and stat["elapsed_s"], "app_stddev_s": stat and stat["elapsed_stddev_s"],
