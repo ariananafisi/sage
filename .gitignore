@@ -11,3 +11,5 @@ build/
 .env.*
 !.env.example
 evals/
+# CoMD writes a YAML log to the current directory
+CoMD-*.yaml
