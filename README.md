@@ -337,8 +337,9 @@ The system prompt tells the agent:
 - a general diagnosis method, applied to every application function with at least 3% of self time.
   It contains nothing specific to LULESH or CoMD:
   1. **Load imbalance:** from the per-thread or per-rank split in `summary.md`. An imbalance factor
-     around 1.3 or more, with waiting time in the parallel runtime, means uneven work. It is
-     reported for the function with the uneven work, not the runtime's spin loop.
+     of about 1.1 or more (1.0 is even) means uneven work. When the busiest workers in that function
+     spend the least time in the parallel runtime, the others are waiting for them. It is reported
+     for the function with the uneven work, not the runtime's spin loop.
   2. **Memory-bound or not:** from a working-set experiment. Rerun with a problem that fits well
      inside the last-level cache, then compare cost per unit of work with
      `compare --work`. A per-unit ratio of about 0.8 or less means memory-bound; about 0.9–1.1 means
@@ -540,8 +541,6 @@ unmodified one.
 name: comd                         # lowercase letters, digits, '-'
 target: comd
 config: ../configs/comd.yaml       # relative to the suite file
-false_positive_types: [load_imbalance, memory_latency_bound, memory_bandwidth_bound]
-injection_sites: [ljForce]         # optional; see "False positives" below
 cases:
   - id: negative-control
     mpi: true                      # optional: use the config's MPI variant
@@ -580,13 +579,11 @@ For each case, `results.json` records:
 - **function found:** a finding names the expected function.
 - **type found:** a finding names the expected function with one of the expected bottleneck
   types. That finding's rank is recorded.
-- **false positives:** findings that report one of the suite's injected bottleneck types for an
-  injection site (a function the suite's patches change), in a case that did not inject that type
-  there. Two kinds of finding are never false positives:
-  - a natural finding in another function. For example, LULESH's OpenMP runtime spin-waits even
-    when unmodified, and a "load imbalance in libgomp" finding is not counted.
-  - a finding that agrees with the reference classification, such as
-    `CalcFBHourglassForceForElems` reported as memory-bound in the unmodified case.
+- **false positives:** findings that report a bottleneck another case of the suite injects (its
+  expected function and one of its expected types), in a case that does not inject it. For
+  example, `CalcKinematicsForElems` reported as memory-bound in LULESH's negative control or
+  load-imbalance case. Other findings are not counted: they may be real properties of the
+  unmodified code on this host, such as a memory-sensitive loop or OpenMP spin-waiting.
 - **reference agreement** (cases with a `reference`): for each reference function the agent
   reports, its class is compared with the reference's. The class is taken from the agent's
   best-ranked finding for that function:

@@ -58,11 +58,15 @@ Follow these steps in order. The commands for each are given in the task.
 
 Classify every application function with at least 3% of self time. Decide in this order.
 
-1. **Load imbalance** (no experiment needed). In summary.md, an imbalance factor of about 1.3 or more
-   for a function means its work is spread unevenly over threads or ranks. If parallel runtime
-   libraries also show waiting time, the other workers are waiting for the slow one:
-   `load_imbalance`, reported for the application function with the uneven work (not for the
-   runtime's spin function). Waiting time with even work in every function instead suggests
+1. **Load imbalance** (no experiment needed). In summary.md, an application function's imbalance
+   factor says how evenly its work is spread over the threads or ranks: about 1.05 or less is even;
+   about 1.1 or more is uneven. The factor is diluted by the number of workers: with 4 workers, one
+   doing 30% more than the others gives only about 1.2. Then check the per-worker time in the
+   parallel runtime libraries (in summary.md): if the workers with the most time in that function
+   have the least runtime time, the others are waiting for them, and the function is
+   `load_imbalance`. Report it for the application function with the uneven work, not for the
+   runtime's wait or progress functions, and classify the function as `load_imbalance` even if it
+   is also compute-heavy. Waiting time with even work in every function instead suggests
    `synchronization` or a `serial_section`.
 2. **Memory-bound or not.** Decide with a working-set experiment, which classifies every function
    at once:

@@ -13,10 +13,7 @@ config: ../configs/lulesh.yaml
 # 4 cores; the classification is per iteration. To score against the reference, run on a node like the
 # study's: bottleneck-agent eval --suite suites/lulesh.yaml --env OMP_NUM_THREADS=<cores per domain>
 run: "{binary} -s 120 -i 40 -b 0 -c 0"
-# False positives: an injected bottleneck type reported for an injection site in a case that did not
-# inject it there. A finding that agrees with the reference classification is never a false positive.
-false_positive_types: [load_imbalance, memory_latency_bound, memory_bandwidth_bound]
-injection_sites: [CalcFBHourglassForceForElems, CalcKinematicsForElems]
+# False positives: a case reporting a bottleneck that another case injects (its function and type).
 cases:
   - id: negative-control
     description: >-

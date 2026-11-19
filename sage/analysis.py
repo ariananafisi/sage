@@ -86,12 +86,14 @@ def function_table(reports: dict[str, dict], kind: str) -> dict:
         f["amount"] = round(f["amount"], 4)
         f["per_worker"] = {w: round(f["per_worker"].get(w, 0.0), 4) for w in workers}
     runtime = sum(f["amount"] for f in funcs.values() if f["runtime"])
+    runtime_per_worker = {w: round(sum(f["per_worker"].get(w, 0.0) for f in funcs.values() if f["runtime"]), 4)
+                          for w in workers}
     kernel = sum(f["amount"] for f in funcs.values() if f["kernel"])
     return {"event": event, "unit": unit, "worker_kind": kind, "workers": workers,
             "worker_totals": {w: round(worker_totals[w], 4) for w in workers}, "total": round(total, 4),
             "runtime_share_pct": round(runtime / total * 100, 2) if total else 0.0,
             "kernel_share_pct": round(kernel / total * 100, 2) if total else 0.0,
-            "functions": rows}
+            "runtime_per_worker": runtime_per_worker, "functions": rows}
 
 
 def _worker_key(worker: str):
@@ -150,7 +152,11 @@ def render_summary(meta: dict, table: dict, peak_rss_kb: int | None) -> str:
               f"{len(table['workers'])} {kind}(s): " + ", ".join(
                   f"{w.split()[1]}: {_num(a, unit)}" for w, a in table["worker_totals"].items()),
               f"- Parallel runtime libraries (waiting / spinning): {table['runtime_share_pct']}% of samples; "
-              f"kernel: {table['kernel_share_pct']}%", "",
+              f"kernel: {table['kernel_share_pct']}%"]
+    if len(table["workers"]) > 1:
+        lines.append(f"- Time in parallel runtime libraries per {kind}: " + ", ".join(
+            f"{w.split()[1]}: {_num(a, unit)}" for w, a in table["runtime_per_worker"].items()))
+    lines += ["",
               f"## Functions by self time ({unit})", "",
               f"Imbalance is max / mean of a function's time over the {len(table['workers'])} {kind}s "
               f"(1.0 = even). Per-{kind} columns are in {unit}.", "",

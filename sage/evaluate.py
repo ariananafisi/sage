@@ -16,7 +16,7 @@ import subprocess
 import sys
 import time
 import traceback
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 import yaml
@@ -66,8 +66,8 @@ class Case:
     patch: Path | None  # applied to the pinned source; None for an unmodified case
     mpi: bool
     expect: Expect | None  # None: a negative control, nothing was injected
-    false_positive_types: tuple[str, ...]  # findings of these types count as false positives ...
-    injection_sites: tuple[str, ...] = ()  # ... if they name one of these functions (empty: any function)
+    # bottlenecks injected by the suite's other cases; reporting one here is a false positive
+    false_positives: tuple[Expect, ...] = ()
     reference: Reference | None = None  # unmodified cases only: score against a published classification
 
 
@@ -167,8 +167,7 @@ def load_suite(path: Path) -> Suite:
         raise SuiteError(f"invalid suite {path}:\n  - top level must be a mapping")
     errors = [f"missing required key '{k}'" for k in ("name", "target", "config", "cases") if k not in data]
     errors += [f"unknown key '{k}'" for k in data
-               if k not in ("name", "target", "config", "cases", "description", "false_positive_types",
-                            "injection_sites", "run", "env")]
+               if k not in ("name", "target", "config", "cases", "description", "run", "env")]
     base = path.parent
     name, target = data.get("name"), data.get("target")
     if "name" in data and not (isinstance(name, str) and CASE_ID.fullmatch(name)):
@@ -183,13 +182,6 @@ def load_suite(path: Path) -> Suite:
             errors.append(f"config: {e}")
     elif "config" in data:
         errors.append("config must be a path to the target config, relative to the suite file")
-    default_fp = data.get("false_positive_types", [])
-    errors += _check_types(default_fp, "false_positive_types")
-    sites = data.get("injection_sites", [])
-    if not isinstance(sites, list) or not all(isinstance(f, str) and re.fullmatch(r"[A-Za-z_]\w*", f) for f in sites):
-        errors.append("injection_sites must be a list of plain function names")
-        sites = []
-
     suite_env = data.get("env") or {}
     if not isinstance(suite_env, dict) or not all(
             re.fullmatch(r"[A-Za-z_]\w*", str(k)) and not str(k).startswith("SAGE_")
@@ -209,7 +201,7 @@ def load_suite(path: Path) -> Suite:
             errors.append(f"{where} must be a mapping")
             continue
         errors += [f"{where}: unknown key '{k}'" for k in raw
-                   if k not in ("id", "description", "patch", "mpi", "expect", "false_positive_types", "reference")]
+                   if k not in ("id", "description", "patch", "mpi", "expect", "reference")]
         cid = raw.get("id")
         if not (isinstance(cid, str) and CASE_ID.fullmatch(cid)):
             errors.append(f"{where}.id must be lowercase letters, digits and '-', got {cid!r}")
@@ -253,18 +245,27 @@ def load_suite(path: Path) -> Suite:
                 errors += [f"{where}.{e}" for e in problems]
         if expect is None and raw.get("expect") != "none":
             continue
-        fp = raw.get("false_positive_types", default_fp)
-        errors += _check_types(fp, f"{where}.false_positive_types")
-        if expect and set(fp) & set(expect.bottleneck_types) and "false_positive_types" in raw:
-            errors.append(f"{where}: a type cannot be both expected and a false positive")
-        if isinstance(fp, list) and isinstance(cid, str):
+        if isinstance(cid, str):
             cases.append(Case(id=cid, description=str(raw.get("description", "")), patch=patch, mpi=bool(mpi),
-                              expect=expect, injection_sites=tuple(sites), reference=reference,
-                              false_positive_types=tuple(t for t in fp if not expect or t not in expect.bottleneck_types)))
+                              expect=expect, reference=reference))
     if errors:
         raise SuiteError(f"invalid suite {path}:\n" + "\n".join(f"  - {e}" for e in errors))
+    cases = [replace(c, false_positives=injected_elsewhere(c, cases)) for c in cases]
     return Suite(name=name, target=target, config=(base / data["config"]).resolve(), cases=tuple(cases), path=path,
                  run=suite_run, env=tuple((str(k), str(v)) for k, v in suite_env.items()))
+
+
+def injected_elsewhere(case: Case, cases: list[Case]) -> tuple[Expect, ...]:
+    """The bottlenecks the other cases inject, less any this case expects for the same function."""
+    out = []
+    for other in cases:
+        if other.expect is None or other is case:
+            continue
+        own = case.expect.bottleneck_types if case.expect and case.expect.function == other.expect.function else ()
+        types = tuple(t for t in other.expect.bottleneck_types if t not in own)
+        if types and Expect(other.expect.function, types) not in out:
+            out.append(Expect(other.expect.function, types))
+    return tuple(out)
 
 
 def _check_types(value, where: str, required: bool = False) -> list[str]:
@@ -312,10 +313,8 @@ def score(case: Case, findings: dict | None, status: int, run_dir: Path, duratio
     scored_reference = case.reference if result["reference"] and result["reference"]["applicable"] else None
     result["false_positives"] = [{"rank": f["rank"], "function": f["function"], "bottleneck_type": f["bottleneck_type"]}
                                  for f in sorted(found, key=lambda f: f["rank"])
-                                 if f["bottleneck_type"] in case.false_positive_types
-                                 and (not case.injection_sites
-                                      or any(function_matches(f["function"], site) for site in case.injection_sites))
-                                 and not agrees_with_reference(scored_reference, f)]
+                                 if any(function_matches(f["function"], e.function)
+                                        and f["bottleneck_type"] in e.bottleneck_types for e in case.false_positives)]
     reference_ok = (scored_reference is None
                     or (result["reference"]["reported"] > 0
                         and result["reference"]["agreed"] == result["reference"]["reported"]))
@@ -341,13 +340,6 @@ def score_reference(reference: Reference, found: list[dict]) -> dict:
     return {"source": reference.source, "url": reference.url, "variant": reference.variant, "functions": rows,
             "total": len(rows), "reported": sum(r["reported"] for r in rows),
             "agreed": sum(bool(r["agrees"]) for r in rows)}
-
-
-def agrees_with_reference(reference: Reference | None, finding: dict) -> bool:
-    if reference is None:
-        return False
-    cls = ROOFLINE_CLASS.get(finding["bottleneck_type"])
-    return any(function_matches(finding["function"], fn) and cls == ref_cls for fn, ref_cls in reference.classes)
 
 
 def summarize(cases: list[dict]) -> dict:

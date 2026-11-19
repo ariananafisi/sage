@@ -1,7 +1,6 @@
 name: fixture
 target: lulesh
 config: ../../../configs/lulesh.yaml
-false_positive_types: [load_imbalance, poor_vectorization]
 cases:
   - id: negative-control
     description: unmodified source

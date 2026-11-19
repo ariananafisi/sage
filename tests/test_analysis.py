@@ -54,6 +54,7 @@ def test_injected_imbalance_is_visible():
     heavy = max(f["per_worker"], key=f["per_worker"].get)
     others = [v for w, v in f["per_worker"].items() if w != heavy]
     assert f["per_worker"][heavy] > 5 * max(others)
+    assert min(t["runtime_per_worker"], key=t["runtime_per_worker"].get) == heavy  # the others wait for it
     assert t["functions"][0]["symbol"] == FB  # the uneven function is now the top one
 
 
@@ -70,6 +71,7 @@ def test_ranks_are_workers_and_other_events_keep_their_units():
     assert lj["imbalance"] == pytest.approx(930 / 730, abs=0.01)
     assert fn(t, "opal_progress")["runtime"]
     assert t["runtime_share_pct"] == pytest.approx(81 / 300 * 100, abs=0.01)  # opal_progress / all samples
+    assert t["runtime_per_worker"] == {"rank 0": 70.0, "rank 1": 370.0, "rank 2": 370.0}  # the busy rank waits least
 
 
 def test_small_threads_are_not_workers():
@@ -105,6 +107,7 @@ def test_render_summary():
     assert "| 1 | `CalcFBHourglassForceForElems(…) [clone ._omp_fn.0]` | lulesh2.0 | " in md
     assert "(runtime) | libgomp.so.1.0.0 |" in md and "(kernel) | [kernel.kallsyms] |" in md
     assert "| thread 1426 | thread 1428 | thread 1429 | thread 1430 |" in md
+    assert "- Time in parallel runtime libraries per thread: 1426: " in md
 
 
 def test_render_compare_per_unit():
