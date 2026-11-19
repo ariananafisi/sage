@@ -78,8 +78,9 @@ Classify every application function with at least 3% of self time. Decide in thi
    - Compare: `compare baseline experiments/<name> --work <units in baseline> <units in experiment>`,
      where units are the amount of work (for example cells × iterations, or atoms × steps; find
      them in `--help`, the source and stdout.log). Pass each side as the product of the numbers it
-     is made of, e.g. `--work 256000*100 4000*2000`, and let the tool multiply; check that the
-     work ratio it prints matches the change you made. Measure what you can: on few cores a
+     is made of, e.g. `--work 256000*100 4000*2000`, and let the tool multiply. Take each number
+     from what the run reports it did (its stdout.log), not from the options you passed: an
+     application may stop early, e.g. when it reaches its end time, and run fewer steps than asked. Measure what you can: on few cores a
      kernel may not draw enough bandwidth to be memory-bound even if it would be on a full node.
    - Read the "per unit B/A" column for each function. Caches are several times faster than main
      memory, so a function limited by memory gets much cheaper per unit once its data fits: about

@@ -351,8 +351,10 @@ The system prompt tells the agent:
 
   The thresholds come from the injected cases on the 4-vCPU development VM, so treat them as
   calibrated on one machine. Once their data fits in cache, a memory-bound injection's cost per
-  unit falls to 0.20–0.46 (LULESH) or 0.25–0.49 (CoMD). Unmodified code falls only to 0.63–1.06
-  (LULESH, depending on how small the experiment is) or stays at 1.07–1.13 (CoMD). An imbalance
+  unit falls to 0.28–0.46 (LULESH) or 0.25–0.49 (CoMD). Unmodified code falls only to 0.75–1.06
+  (LULESH, depending on how small the experiment is) or stays at 1.07–1.13 (CoMD). Work must be
+  counted from what the run reports: LULESH stops at its end time, so `-s 30 -i 2000` runs 932
+  iterations, and counting 2000 makes every kernel look memory-bound. An imbalance
   injection gives a factor of 2.9 (LULESH, threads) or 1.19 (CoMD, ranks); unmodified code gives
   1.01–1.04. The reported LLC (260 MiB) overstates the usable cache: CoMD's injected table behaves
   as cache-resident at 32 MiB but not at 64 MiB.
