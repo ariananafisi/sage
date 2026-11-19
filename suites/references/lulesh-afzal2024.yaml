@@ -11,6 +11,13 @@ measured_on: >-
 settings: >-
   LULESH 2.0, load imbalance off (-b 0 -c 0), -i 300, domain 60^3 to 350^3 (OpenMP) and 60^3 to 150^3
   per process (MPI); working sets at least 10x the last-level cache.
+# The classification holds under the study's conditions. A case is scored against it only when its
+# baseline meets them; otherwise the comparison is reported but not scored. On a few cores, a kernel
+# cannot draw enough bandwidth to hit the memory ceiling, so it may correctly measure as not
+# memory-bound.
+conditions:
+  min_workers: 13             # threads (OpenMP) or ranks (MPI) sharing one memory domain; the study used 13-18
+  min_working_set_to_llc: 10  # peak memory of the largest process / last-level cache size
 # class: memory_bound or not_memory_bound. intensity: measured single-threaded computational intensity
 # on Ice Lake in flop/byte (Table III, OMP-ICL); recorded for reference, not used in scoring.
 variants:

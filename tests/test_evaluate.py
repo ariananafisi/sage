@@ -13,8 +13,8 @@ import pytest
 import yaml
 
 from sage import agent, evaluate
-from sage.evaluate import (Case, Expect, SuiteError, function_matches, load_reference, load_suite, score,
-                           score_reference, summarize)
+from sage.evaluate import (Case, Expect, SuiteError, cache_mib, function_matches, load_reference, load_suite,
+                           reference_conditions, score, score_reference, summarize)
 
 REPO = Path(__file__).resolve().parent.parent
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "eval"
@@ -221,7 +221,7 @@ def test_summarize_and_markdown(tmp_path):
     s = summarize(cases)
     assert s == {"cases": 3, "correct": 1, "completed": 2, "errors": 1, "injected_cases": 2, "function_found": 1,
                  "type_found": 1, "negative_controls": 1, "reference_functions": 0, "reference_reported": 0,
-                 "reference_agreed": 0, "cases_with_false_positives": 1, "false_positives": 1,
+                 "reference_agreed": 0, "reference_not_scored": 0, "cases_with_false_positives": 1, "false_positives": 1,
                  "experiments": 1, "total_duration_s": 300.0}
     md = evaluate.render_markdown({"suite": "lulesh", "target": "lulesh", "model": "gpt-5", "started_at": "t",
                                    "suite_path": "suites/lulesh.yaml", "cases": cases, "summary": s})
@@ -387,8 +387,8 @@ def test_only_selected_cases(tmp_path, harness):
 def cli(monkeypatch, tmp_path):
     seen = {}
 
-    def fake_run_suite(suite, out, root, client, limits, base_url, only=None):
-        seen.update(suite=suite, out=out, limits=limits, only=only, client=client)
+    def fake_run_suite(suite, out, root, client, limits, base_url, only=None, env=None):
+        seen.update(suite=suite, out=out, limits=limits, only=only, client=client, env=env)
         return {"summary": {"correct": 1, "cases": 1, "errors": seen.get("errors", 0)}}
     monkeypatch.setattr(evaluate, "run_suite", fake_run_suite)
     monkeypatch.setenv("HOKIEAI_API", "k")
@@ -425,13 +425,14 @@ def test_cli_eval_errors(cli, tmp_path, capsys):
 
 def test_shipped_lulesh_reference():
     suite = load_suite(REPO / "suites" / "lulesh.yaml")
-    assert suite.run == "{binary} -s 90 -i 100 -b 0 -c 0"
+    assert suite.run == "{binary} -s 120 -i 40 -b 0 -c 0"
     control = {c.id: c for c in suite.cases}["negative-control"]
     ref = control.reference
     assert ref.variant == "openmp" and "2412.08792" in ref.url and ref.path.parent.name == "references"
     classes = dict(ref.classes)
     assert len(classes) == 6 and classes["CalcKinematicsForElems"] == "not_memory_bound"
     assert sum(c == "memory_bound" for c in classes.values()) == 5
+    assert (ref.min_workers, ref.min_working_set_to_llc) == (13, 10)
     mpi, _ = load_reference(ref.path, "mpi")
     assert dict(mpi.classes)["IntegrateStressForElems"] == "not_memory_bound"
     # the memory-bound injection targets the one hot spot the reference finds not memory-bound
@@ -535,3 +536,94 @@ def test_suite_run_command_reaches_the_case_config(tmp_path, harness):
     suite = evaluate.Suite(**{**suite.__dict__, "run": "{binary} -s 7 -b 0"})
     evaluate.run_suite(suite, tmp_path / "out", tmp_path, None, agent.Limits(), "u", only=["negative-control"])
     assert yaml.safe_load(Path(harness[0]["config"]).read_text())["run"] == "{binary} -s 7 -b 0"
+
+
+# --- reference conditions: only score against a reference on hardware like the study's -------------
+
+@pytest.mark.parametrize("text,mib", [("260 MiB (1 instance)", 260), ("108 MiB (2 instances)", 54),
+                                      ("512 KiB", 0.5), ("1 GiB", 1024), ("", None), (None, None)])
+def test_cache_mib(text, mib):
+    assert cache_mib(text) == mib
+
+
+
+
+
+def conditional_reference():
+    ref, _ = load_reference(FIXTURES / "references" / "roofline.yaml", "openmp")
+    return evaluate.Reference(**{**ref.__dict__, "min_workers": 13, "min_working_set_to_llc": 10})
+
+
+def baseline_meta(threads="4", rss=1525.0, l3="260 MiB (1 instance)", ranks=None):
+    return {"mpi": {"ranks": ranks} if ranks else None, "peak_rss_mb": rss, "host": {"l3_cache": l3},
+            "threads": {"variables": {"OMP_NUM_THREADS": threads} if threads else {}}}
+
+
+@pytest.mark.parametrize("meta,applicable,reason", [
+    (baseline_meta(threads="18", rss=600.0, l3="54 MiB (1 instance)"), True, None),
+    (baseline_meta(threads="4", rss=600.0, l3="54 MiB (1 instance)"), False, "4 worker(s) (threads or ranks); the reference needs at least 13"),
+    (baseline_meta(threads="18", rss=1525.0, l3="260 MiB (1 instance)"), False, "working set 1525 MiB is 5.9x the 260 MiB last-level cache"),
+    (baseline_meta(threads=None, ranks=27, rss=1000.0, l3="108 MiB (2 instances)"), True, None),
+    (baseline_meta(threads="18", rss=None), False, "the working set or the last-level cache size is unknown"),
+    (None, False, "the baseline's metadata.json is missing"),
+])
+def test_reference_conditions(meta, applicable, reason):
+    c = reference_conditions(conditional_reference(), meta)
+    assert c["applicable"] is applicable
+    if reason:
+        assert any(reason in r for r in c["reasons"]), c["reasons"]
+
+
+def test_unmet_conditions_report_but_do_not_score(tmp_path):
+    run_dir = run_dir_with(tmp_path)
+    (run_dir / "baseline").mkdir()
+    (run_dir / "baseline" / "metadata.json").write_text(json.dumps(baseline_meta(threads="4")))
+    case = Case(**{**REF_CASE.__dict__, "reference": conditional_reference()})
+    findings = fixture("reference-diagnosis.json")
+    findings["findings"][1]["bottleneck_type"] = "compute_bound"  # everything else would be correct
+    result = score(case, findings, agent.OK, run_dir, 10)
+    ref = result["reference"]
+    assert ref["applicable"] is False and ref["workers"] == 4 and ref["agreed"] == 2  # still shown
+    # not scored: memory-bound at an injection site is no longer excused by the reference
+    assert [f["rank"] for f in result["false_positives"]] == [1] and not result["correct"]
+    s = summarize([{"id": "c", "run_id": "case-1", **result}])
+    assert s["reference_functions"] == 0 and s["reference_not_scored"] == 1
+    md = evaluate.render_markdown({"suite": "l", "target": "lulesh", "model": "m", "started_at": "t", "suite_path": "p",
+                                   "cases": [{"id": "c", "run_id": "case-1", "patch": None, "run_dir": "r", **result}],
+                                   "summary": s})
+    assert "**Not scored on this host**" in md and "(not scored on this host)" in md
+    assert "Reference comparisons not scored on this host: 1." in md
+    # the same diagnosis on a matching node is scored and correct
+    (run_dir / "baseline" / "metadata.json").write_text(json.dumps(baseline_meta(threads="18", rss=600.0, l3="54 MiB")))
+    good = score(case, findings, agent.OK, run_dir, 10)
+    assert good["reference"]["applicable"] and good["false_positives"] == [] and good["correct"]
+
+
+def test_invalid_conditions(tmp_path):
+    (tmp_path / "r.yaml").write_text("source: s\nurl: u\nconditions: {min_workers: 0, cores: 3}\n"
+                                     "variants: {openmp: {f: {class: memory_bound}}}\n")
+    _, errors = load_reference(tmp_path / "r.yaml", "openmp")
+    assert any("conditions may only set" in e for e in errors)
+
+
+def test_env_reaches_every_case_config(tmp_path, harness):
+    suite = load_suite(FIXTURES / "suite.yaml")
+    suite = evaluate.Suite(**{**suite.__dict__, "env": (("OMP_PROC_BIND", "close"), ("OMP_NUM_THREADS", "8"))})
+    results = evaluate.run_suite(suite, tmp_path / "out", tmp_path, None, agent.Limits(), "u",
+                                 only=["negative-control"], env={"OMP_NUM_THREADS": "18"})
+    env = yaml.safe_load(Path(harness[0]["config"]).read_text())["env"]
+    assert env["OMP_NUM_THREADS"] == "18" and env["OMP_PROC_BIND"] == "close"  # the command line wins
+    assert results["env"] == {"OMP_PROC_BIND": "close", "OMP_NUM_THREADS": "18"}
+
+
+def test_suite_env_validation(tmp_path):
+    with pytest.raises(SuiteError, match="env must map variable names"):
+        load_suite(write_suite(tmp_path, {**BASE, "env": {"SAGE_X": 1}}))
+
+
+def test_cli_eval_env(cli, capsys):
+    assert agent.main(["eval", "--suite", str(REPO / "suites/lulesh.yaml"), "--env", "OMP_NUM_THREADS=18"]) == 0
+    assert cli["env"] == {"OMP_NUM_THREADS": "18"}
+    with pytest.raises(SystemExit):
+        agent.main(["eval", "--suite", str(REPO / "suites/lulesh.yaml"), "--env", "bad"])
+    assert "--env needs NAME=VALUE" in capsys.readouterr().err

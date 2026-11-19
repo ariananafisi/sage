@@ -23,8 +23,9 @@ cases:
       bottleneck_types: [load_imbalance]
   - id: memory-bound
     description: >-
-      Every atom in ljForce follows a chain of dependent, scattered reads through a 256 MB table (far larger
-      than the caches) each step, so the kernel waits on memory. Serial build, like the config's default run.
+      Atoms in ljForce follow one dependent chain of scattered reads through a table of 1024 entries per
+      atom (1 GiB at 30^3 cells, 32 MiB at 10^3), so the kernel waits on memory, and its cost per atom
+      drops once the table fits in cache. Serial build, like the config's default run.
     patch: patches/comd-memory-bound.patch
     expect:
       function: ljForce

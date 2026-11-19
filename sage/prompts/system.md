@@ -71,14 +71,17 @@ Classify every application function with at least 3% of self time. Decide in thi
      still runs for a few seconds. Change nothing else.
    - Compare: `compare baseline experiments/<name> --work <units in baseline> <units in experiment>`,
      where units are the amount of work (for example cells × iterations, or atoms × steps; work
-     them out from `--help`, the source and stdout.log).
+     them out from `--help`, the source and stdout.log). Measure what you can: on few cores a
+     kernel may not draw enough bandwidth to be memory-bound even if it would be on a full node.
    - Read the "per unit B/A" column for each function. Cost per unit falling clearly once the data
-     fits in cache (about 0.7 or less) means the function is memory-bound: `memory_bandwidth_bound`
+     fits in cache (about 0.8 or less) means the function is memory-bound: `memory_bandwidth_bound`
      if it streams through arrays, `memory_latency_bound` if its loads are dependent, indirect or
-     scattered. Cost per unit staying the same (about 0.85 to 1.15) means it is not memory-bound:
+     scattered. Cost per unit staying the same (about 0.9 to 1.1) means it is not memory-bound:
      `compute_bound`; or `poor_vectorization` if the annotation shows scalar arithmetic in a loop
      that could use SIMD; or `branch_misprediction` only with branch counters to back it. Values
-     in between are partly memory-sensitive: say so, and lower your confidence.
+     in between are partly memory-sensitive: say so, and lower your confidence. A function can appear
+     as several symbols (e.g. `foo [clone ._omp_fn.0]` and `._omp_fn.1` for its parallel loops):
+     classify each loop, and report the function by the one with most time.
 3. **Corroborate with the annotation.** In memory-bound code the hot instructions are loads, or the
    instruction just after a load (samples skid by one or two instructions), often indexed or
    indirect. In compute-bound code the samples spread over arithmetic.

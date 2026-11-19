@@ -440,6 +440,8 @@ def main(argv: list[str] | None = None) -> int:
     evaluate.add_argument("--out", type=Path, metavar="DIR",
                           help="output directory (default: evals/<suite>-<timestamp>)")
     evaluate.add_argument("--cases", metavar="ID,ID", help="run only these case ids")
+    evaluate.add_argument("--env", action="append", default=[], metavar="NAME=VALUE",
+                          help="set an environment variable for every case, e.g. OMP_NUM_THREADS=18 (repeatable)")
     add_limit_options(evaluate)
     args = parser.parse_args(argv)
 
@@ -454,11 +456,17 @@ def main(argv: list[str] | None = None) -> int:
             evaluate.error(f"unknown case id(s): {', '.join(sorted(unknown))} "
                            f"(suite has {', '.join(c.id for c in suite.cases)})")
         limits = limits_from(args, evaluate)
+        env = {}
+        for item in args.env:
+            name, sep, value = item.partition("=")
+            if not sep or not re.fullmatch(r"[A-Za-z_]\w*", name) or name.startswith("SAGE_"):
+                evaluate.error(f"--env needs NAME=VALUE with a valid name (not SAGE_*), got {item!r}")
+            env[name] = value
         out = args.out or Path("evals") / f"{suite.name}-{time.strftime('%Y%m%d-%H%M%S')}"
         if out.exists():
             evaluate.error(f"{out} already exists; choose another --out")
         client, base_url = client_from(evaluate)
-        results = run_suite(suite, out.resolve(), Path.cwd(), client, limits, base_url, only)
+        results = run_suite(suite, out.resolve(), Path.cwd(), client, limits, base_url, only, env)
         s = results["summary"]
         print(f"\n{s['correct']} of {s['cases']} cases correct; results: {out / 'results.md'}")
         return OK if s["errors"] == 0 else FAILED

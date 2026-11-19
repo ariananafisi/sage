@@ -1,28 +1,30 @@
 diff --git a/src-mpi/ljForce.c b/src-mpi/ljForce.c
-index ebc60e1..aff966d 100644
+index ebc60e1..ef18515 100644
 --- a/src-mpi/ljForce.c
 +++ b/src-mpi/ljForce.c
-@@ -164,6 +164,19 @@ int ljForce(SimFlat* s)
+@@ -164,6 +164,21 @@ int ljForce(SimFlat* s)
     real_t rCut6 = s6 / (rCut2*rCut2*rCut2);
     real_t eShift = POT_SHIFT * rCut6 * (rCut6 - 1.0);
  
-+   // Pair correction table (32M entries), shared by all atoms.
++   // Pair correction table: 1024 entries per atom, shared by all atoms.
 +   static real_t* corrTable = NULL;
-+   const unsigned int corrMask = (1u << 25) - 1;
++   static unsigned int corrMask = 0;
 +   if (corrTable == NULL)
 +   {
-+      corrTable = comdMalloc((corrMask + 1) * sizeof(real_t));
-+      for (unsigned int i = 0; i <= corrMask; i++)
++      unsigned int size = 1;
++      while (size < 1024u * (unsigned int)s->atoms->nLocal) size <<= 1;
++      corrMask = size - 1;
++      corrTable = comdMalloc(size * sizeof(real_t));
++      for (unsigned int i = 0; i < size; i++)
 +         corrTable[i] = 0.0;
 +   }
-+
 +   unsigned int corrIdx = 0;
 +   real_t corrSum = 0.0;
 +
     int nbrBoxes[27];
     // loop over local boxes
     for (int iBox=0; iBox<s->boxes->nLocalBoxes; iBox++)
-@@ -171,6 +184,16 @@ int ljForce(SimFlat* s)
+@@ -171,6 +186,16 @@ int ljForce(SimFlat* s)
        int nIBox = s->boxes->nAtoms[iBox];
        if ( nIBox == 0 ) continue;
        int nNbrBoxes = getNeighborBoxes(s->boxes, iBox, nbrBoxes);
@@ -39,7 +41,7 @@ index ebc60e1..aff966d 100644
        // loop over neighbors of iBox
        for (int jTmp=0; jTmp<nNbrBoxes; jTmp++)
        {
-@@ -228,6 +251,7 @@ int ljForce(SimFlat* s)
+@@ -228,6 +253,7 @@ int ljForce(SimFlat* s)
        } // loop over neighbor boxes
     } // loop over local boxes in system
  

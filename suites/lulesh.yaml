@@ -7,10 +7,12 @@
 name: lulesh
 target: lulesh
 config: ../configs/lulesh.yaml
-# The study's settings: load imbalance off (-b 0 -c 0) and a working set (~650 MB at -s 90) far beyond
-# the last-level cache. Fewer iterations than its 300 keep a run near 25 s; the classification is per
-# iteration.
-run: "{binary} -s 90 -i 100 -b 0 -c 0"
+# The study's settings: load imbalance off (-b 0 -c 0) and a working set (~1.5 GB at -s 120) beyond
+# the last-level cache; the reference's conditions (in its file) say how far beyond, and how many
+# threads, for its classification to apply. Fewer iterations than its 300 keep a run near 25 s on
+# 4 cores; the classification is per iteration. To score against the reference, run on a node like the
+# study's: bottleneck-agent eval --suite suites/lulesh.yaml --env OMP_NUM_THREADS=<cores per domain>
+run: "{binary} -s 120 -i 40 -b 0 -c 0"
 # False positives: an injected bottleneck type reported for an injection site in a case that did not
 # inject it there. A finding that agrees with the reference classification is never a false positive.
 false_positive_types: [load_imbalance, memory_latency_bound, memory_bandwidth_bound]
@@ -33,7 +35,9 @@ cases:
   - id: memory-bound
     description: >-
       Every element of CalcKinematicsForElems, the one hot spot the reference finds not memory-bound,
-      follows a chain of dependent, scattered reads through a 256 MB table, which makes it memory-bound.
+      follows a chain of dependent, scattered reads through a table of 64 entries per element (1 GiB at
+      -s 120, 16 MiB at -s 30), which makes it memory-bound: its cost per element drops once the
+      table fits in cache.
     patch: patches/lulesh-memory-bound.patch
     expect:
       function: CalcKinematicsForElems

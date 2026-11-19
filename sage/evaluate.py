@@ -55,6 +55,8 @@ class Reference:
     variant: str
     classes: tuple[tuple[str, str], ...]  # (function, memory_bound | not_memory_bound), in the source's order
     path: Path
+    min_workers: int | None = None  # the reference only applies with at least this many threads/ranks ...
+    min_working_set_to_llc: float | None = None  # ... and a working set at least this many times the LLC
 
 
 @dataclass(frozen=True)
@@ -77,6 +79,7 @@ class Suite:
     cases: tuple[Case, ...]
     path: Path
     run: str | None = None  # replaces the config's run command for every case ("{binary} ...")
+    env: tuple[tuple[str, str], ...] = ()  # environment variables set for every case (over the config's env)
 
 
 def load_reference(path: Path, variant: str) -> tuple[Reference | None, list[str]]:
@@ -105,10 +108,50 @@ def load_reference(path: Path, variant: str) -> tuple[Reference | None, list[str
             errors.append(f"reference {path}: {fn}.class must be one of {', '.join(REFERENCE_CLASSES)}, got {cls!r}")
         else:
             classes.append((fn, cls))
+    conditions = data.get("conditions") or {}
+    if not isinstance(conditions, dict) or set(conditions) - {"min_workers", "min_working_set_to_llc"}:
+        errors.append(f"reference {path}: conditions may only set min_workers and min_working_set_to_llc")
+        conditions = {}
+    for key, value in conditions.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            errors.append(f"reference {path}: conditions.{key} must be a positive number, got {value!r}")
     if errors:
         return None, errors
     return Reference(source=str(data["source"]), url=str(data["url"]), variant=variant, classes=tuple(classes),
-                     path=Path(path).resolve()), []
+                     path=Path(path).resolve(), min_workers=conditions.get("min_workers"),
+                     min_working_set_to_llc=conditions.get("min_working_set_to_llc")), []
+
+
+def cache_mib(text: str | None) -> float | None:
+    """lscpu's cache size, per instance: '260 MiB (1 instance)' -> 260, '108 MiB (2 instances)' -> 54."""
+    m = re.match(r"\s*([\d.]+)\s*([KMG])i?B?(?:\s*\((\d+) instances?\))?", text or "")
+    if not m:
+        return None
+    size = float(m.group(1)) * {"K": 1 / 1024, "M": 1, "G": 1024}[m.group(2)]
+    return size / int(m.group(3) or 1)
+
+
+def reference_conditions(reference: Reference, baseline: dict | None) -> dict:
+    """Whether a case's baseline run met the reference's conditions, from its metadata.json."""
+    baseline = baseline or {}
+    mpi = baseline.get("mpi") or {}
+    threads = (baseline.get("threads") or {}).get("variables", {}).get("OMP_NUM_THREADS", "")
+    workers = mpi.get("ranks") or (int(threads) if str(threads).isdigit() else 1)
+    peak, llc = baseline.get("peak_rss_mb"), cache_mib((baseline.get("host") or {}).get("l3_cache"))
+    ratio = round(peak / llc, 1) if peak and llc else None
+    reasons = []
+    if not baseline and (reference.min_workers or reference.min_working_set_to_llc):
+        reasons.append("the baseline's metadata.json is missing")
+    if reference.min_workers and workers < reference.min_workers:
+        reasons.append(f"{workers} worker(s) (threads or ranks); the reference needs at least {reference.min_workers}")
+    if reference.min_working_set_to_llc and baseline:
+        if ratio is None:
+            reasons.append("the working set or the last-level cache size is unknown")
+        elif ratio < reference.min_working_set_to_llc:
+            reasons.append(f"working set {peak:g} MiB is {ratio}x the {llc:g} MiB last-level cache; the reference "
+                           f"needs at least {reference.min_working_set_to_llc:g}x")
+    return {"applicable": not reasons, "reasons": reasons, "workers": workers, "peak_rss_mb": peak,
+            "llc_mib": llc, "working_set_to_llc": ratio}
 
 
 def load_suite(path: Path) -> Suite:
@@ -125,7 +168,7 @@ def load_suite(path: Path) -> Suite:
     errors = [f"missing required key '{k}'" for k in ("name", "target", "config", "cases") if k not in data]
     errors += [f"unknown key '{k}'" for k in data
                if k not in ("name", "target", "config", "cases", "description", "false_positive_types",
-                            "injection_sites", "run")]
+                            "injection_sites", "run", "env")]
     base = path.parent
     name, target = data.get("name"), data.get("target")
     if "name" in data and not (isinstance(name, str) and CASE_ID.fullmatch(name)):
@@ -147,6 +190,12 @@ def load_suite(path: Path) -> Suite:
         errors.append("injection_sites must be a list of plain function names")
         sites = []
 
+    suite_env = data.get("env") or {}
+    if not isinstance(suite_env, dict) or not all(
+            re.fullmatch(r"[A-Za-z_]\w*", str(k)) and not str(k).startswith("SAGE_")
+            and isinstance(v, (str, int, float)) and not isinstance(v, bool) for k, v in suite_env.items()):
+        errors.append("env must map variable names (not SAGE_*) to strings or numbers")
+        suite_env = {}
     suite_run = data.get("run")
     if suite_run is not None and placeholders(suite_run) != {"binary"}:
         errors.append("run must be a command string using the {binary} placeholder and no other {…} fields")
@@ -215,7 +264,7 @@ def load_suite(path: Path) -> Suite:
     if errors:
         raise SuiteError(f"invalid suite {path}:\n" + "\n".join(f"  - {e}" for e in errors))
     return Suite(name=name, target=target, config=(base / data["config"]).resolve(), cases=tuple(cases), path=path,
-                 run=suite_run)
+                 run=suite_run, env=tuple((str(k), str(v)) for k, v in suite_env.items()))
 
 
 def _check_types(value, where: str, required: bool = False) -> list[str]:
@@ -254,14 +303,20 @@ def score(case: Case, findings: dict | None, status: int, run_dir: Path, duratio
         result["function_found"] = bool(hits)
         result["type_found"] = bool(right)
         result["matched_rank"] = min(f["rank"] for f in right) if right else None
-    result["reference"] = score_reference(case.reference, found) if case.reference else None
+    result["reference"] = None
+    if case.reference:
+        baseline_meta = run_dir / "baseline" / "metadata.json"
+        conditions = reference_conditions(
+            case.reference, json.loads(baseline_meta.read_text()) if baseline_meta.is_file() else None)
+        result["reference"] = {**score_reference(case.reference, found), **conditions}
+    scored_reference = case.reference if result["reference"] and result["reference"]["applicable"] else None
     result["false_positives"] = [{"rank": f["rank"], "function": f["function"], "bottleneck_type": f["bottleneck_type"]}
                                  for f in sorted(found, key=lambda f: f["rank"])
                                  if f["bottleneck_type"] in case.false_positive_types
                                  and (not case.injection_sites
                                       or any(function_matches(f["function"], site) for site in case.injection_sites))
-                                 and not agrees_with_reference(case.reference, f)]
-    reference_ok = (case.reference is None
+                                 and not agrees_with_reference(scored_reference, f)]
+    reference_ok = (scored_reference is None
                     or (result["reference"]["reported"] > 0
                         and result["reference"]["agreed"] == result["reference"]["reported"]))
     result["correct"] = (findings is not None and status == agent.OK and not result["false_positives"]
@@ -308,14 +363,19 @@ def summarize(cases: list[dict]) -> dict:
         "function_found": sum(bool(c.get("function_found")) for c in injected),
         "type_found": sum(bool(c.get("type_found")) for c in injected),
         "negative_controls": len(controls),
-        "reference_functions": sum(c["reference"]["total"] for c in cases if c.get("reference")),
-        "reference_reported": sum(c["reference"]["reported"] for c in cases if c.get("reference")),
-        "reference_agreed": sum(c["reference"]["agreed"] for c in cases if c.get("reference")),
+        "reference_functions": sum(c["reference"]["total"] for c in cases if _scored(c)),
+        "reference_reported": sum(c["reference"]["reported"] for c in cases if _scored(c)),
+        "reference_agreed": sum(c["reference"]["agreed"] for c in cases if _scored(c)),
+        "reference_not_scored": sum(bool(c.get("reference")) and not _scored(c) for c in cases),
         "cases_with_false_positives": sum(bool(c.get("false_positives")) for c in cases),
         "false_positives": sum(len(c.get("false_positives") or []) for c in cases),
         "experiments": sum(c.get("experiments") or 0 for c in cases),
         "total_duration_s": round(sum(c["duration_s"] for c in finished), 1),
     }
+
+
+def _scored(case: dict) -> bool:
+    return bool(case.get("reference")) and case["reference"].get("applicable", True)
 
 
 def render_markdown(results: dict) -> str:
@@ -329,13 +389,16 @@ def render_markdown(results: dict) -> str:
            f"{s['experiments']} experiment run(s), {s['total_duration_s']:g} s in total."
            + (f" Reference classification: {s['reference_agreed']} of {s['reference_reported']} reported hot "
               f"functions agree ({s['reference_reported']} of {s['reference_functions']} reported)."
-              if s.get("reference_functions") else ""), "",
+              if s.get("reference_functions") else "")
+           + (f" Reference comparisons not scored on this host: {s['reference_not_scored']}."
+              if s.get("reference_not_scored") else ""), "",
            "| Case | Injected | Expected | Status | Function found | Type found | False positives | Experiments | Time (s) | Correct |",
            "| --- | --- | --- | --- | --- | --- | --- | ---: | ---: | --- |"]
     for c in results["cases"]:
         expected = (f"`{c['expected']['function']}`: {' or '.join(c['expected']['bottleneck_types'])}"
                     if c.get("expected") else
-                    f"reference: {c['reference']['agreed']} of {c['reference']['reported']} agree"
+                    (f"reference: {c['reference']['agreed']} of {c['reference']['reported']} agree"
+                     + ("" if _scored(c) else " (not scored on this host)"))
                     if c.get("reference") else "nothing (negative control)")
         fps = ", ".join(f"{f['function']} ({f['bottleneck_type']})" for f in c.get("false_positives") or []) or "none"
         out.append(f"| {c['id']} ({c['run_id']}) | {c['patch'] or 'none'} | {expected} | "
@@ -349,7 +412,11 @@ def render_markdown(results: dict) -> str:
             out += [f"Error: `{c['error']}`", ""]
         if c.get("reference"):
             ref = c["reference"]
-            out += [f"Compared with {ref['source']} ({ref['url']}), variant `{ref['variant']}`:", "",
+            out += [f"Compared with {ref['source']} ({ref['url']}), variant `{ref['variant']}`:", ""]
+            if not ref.get("applicable", True):
+                out += ["**Not scored on this host**: the run did not meet the reference's conditions ("
+                        + "; ".join(ref["reasons"]) + "). The comparison is shown for information.", ""]
+            out += [
                     "| Function | Reference | Agent's finding | Agent's class | Agrees |",
                     "| --- | --- | --- | --- | --- |"]
             for row in ref["functions"]:
@@ -412,7 +479,7 @@ def prepare_source(cache: Path, commit: str, repo_url: str, patch: Path | None, 
 
 
 def run_case(suite: Suite, case: Case, run_id: str, case_dir: Path, root: Path, client, limits: agent.Limits,
-             base_url: str, hidden: tuple[Path, ...] = ()) -> dict:
+             base_url: str, hidden: tuple[Path, ...] = (), env: dict[str, str] | None = None) -> dict:
     """Prepare and run one case. Raises on setup problems; the caller records them."""
     cfg = load_config(suite.config, suite.target)
     cache = pinned_cache(root, cfg.repo_url, cfg.commit)
@@ -420,7 +487,11 @@ def run_case(suite: Suite, case: Case, run_id: str, case_dir: Path, root: Path, 
     raw = yaml.safe_load(suite.config.read_text())
     raw["commit"] = commit
     if suite.run:  # e.g. the settings a reference study used
-        (raw["mpi"] if case.mpi else raw)["run"] = suite.run  # the case's own source: pinned + patch, verified by the source check
+        (raw["mpi"] if case.mpi else raw)["run"] = suite.run
+    if env:  # e.g. OMP_NUM_THREADS for a node like the reference study's
+        raw["env"] = {**(raw.get("env") or {}), **env}
+        if case.mpi:
+            raw["mpi"]["env"] = {**(raw["mpi"].get("env") or {}), **env}  # the case's own source: pinned + patch, verified by the source check
     config_path = case_dir / "config.yaml"
     config_path.write_text(yaml.safe_dump(raw, sort_keys=False))
     case_cfg = load_config(config_path, suite.target)
@@ -454,10 +525,11 @@ def hidden_attempts(transcript: Path) -> int:
 
 
 def run_suite(suite: Suite, out: Path, root: Path, client, limits: agent.Limits, base_url: str,
-              only: list[str] | None = None) -> dict:
+              only: list[str] | None = None, env: dict[str, str] | None = None) -> dict:
     out.mkdir(parents=True)
+    env = {**dict(suite.env), **(env or {})}
     results = {"suite": suite.name, "suite_path": str(suite.path), "target": suite.target, "model": limits.model,
-               "limits": asdict(limits), "base_url": base_url, "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+               "limits": asdict(limits), "base_url": base_url, "env": env, "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                "cases": [], "summary": {}}
     cases = [c for c in suite.cases if not only or c.id in only]
     for n, case in enumerate(cases, 1):
@@ -472,7 +544,7 @@ def run_suite(suite: Suite, out: Path, root: Path, client, limits: agent.Limits,
         hidden = (suite.path.parent.resolve(), out / "results.json", out / "results.md",
                   *[out / "cases" / f"case-{k}" for k in range(1, len(cases) + 1) if k != n])
         try:
-            record.update(run_case(suite, case, run_id, case_dir, root, client, limits, base_url, hidden))
+            record.update(run_case(suite, case, run_id, case_dir, root, client, limits, base_url, hidden, env))
         except Exception as e:  # one broken case must not stop the others
             record.update({"status": "error", "error": f"{type(e).__name__}: {e}", "correct": False})
             (out / f"{run_id}-error.txt").write_text(traceback.format_exc())

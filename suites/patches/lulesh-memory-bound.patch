@@ -1,22 +1,25 @@
 diff --git a/lulesh.cc b/lulesh.cc
-index c840817..03a5676 100644
+index c840817..1d6ce23 100644
 --- a/lulesh.cc
 +++ b/lulesh.cc
-@@ -1505,6 +1505,13 @@ void CalcElemVelocityGradient( const Real_t* const xvel,
+@@ -1505,6 +1505,16 @@ void CalcElemVelocityGradient( const Real_t* const xvel,
  void CalcKinematicsForElems( Domain &domain,
                               Real_t deltaTime, Index_t numElem )
  {
-+  // Volume correction table, shared by all elements (32M entries).
++  // Volume correction table: 64 entries per element, shared by all elements.
 +  static Real_t *volTable = 0;
-+  const unsigned int volMask = (1u << 25) - 1;
++  static unsigned int volMask = 0;
 +  if (volTable == 0) {
-+    volTable = new Real_t[volMask + 1];
-+    for (unsigned int i = 0; i <= volMask; ++i) volTable[i] = Real_t(0.0);
++    unsigned int size = 1;
++    while (size < 64u * (unsigned int)numElem) size <<= 1;
++    volMask = size - 1;
++    volTable = new Real_t[size];
++    for (unsigned int i = 0; i < size; ++i) volTable[i] = Real_t(0.0);
 +  }
  
    // loop over all elements
  #pragma omp parallel for firstprivate(numElem, deltaTime)
-@@ -1524,11 +1531,19 @@ void CalcKinematicsForElems( Domain &domain,
+@@ -1524,11 +1534,19 @@ void CalcKinematicsForElems( Domain &domain,
      Real_t relativeVolume ;
      const Index_t* const elemToNode = domain.nodelist(k) ;
  

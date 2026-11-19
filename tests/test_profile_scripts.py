@@ -26,6 +26,7 @@ BASH = shutil.which("bash")
 # the annotate fixture for ljForce only. FAKE_PERF_FAIL=<subcommand> makes that subcommand fail.
 FAKE_PERF = r"""#!/usr/bin/env bash
 sub=$1; shift
+all=" $* "
 if [[ $sub == --version ]]; then echo "perf version 6.9.0-fake"; exit 0; fi
 if [[ ${FAKE_PERF_FAIL:-} == "$sub" ]]; then echo "perf $sub: fake failure: Permission denied" >&2; exit 3; fi
 out="" in="" sym=""
@@ -44,7 +45,8 @@ case $sub in
     printf 'PERFILE2 fake for %s\n' "$*" > "$out"; exit $rc ;;
   report)
     [[ -s $in ]] || { echo "perf report: no $in" >&2; exit 1; }
-    cat "${FAKE_REPORT:-$FIXTURES/perf-report.txt}" ;;
+    if [[ $all == *" pid,dso,sym "* ]]; then cat "$FIXTURES/perf-report-threads-lulesh.txt"
+    else cat "${FAKE_REPORT:-$FIXTURES/perf-report.txt}"; fi ;;
   annotate)
     [[ $sym == ljForce ]] && cat "$FIXTURES/perf-annotate.txt"
     [[ $sym == ljForce ]] || echo "Error: The perf.data data has no samples!" >&2 ;;
@@ -124,12 +126,18 @@ def test_one_call_produces_the_full_artifact_set(env):
     r = profile(env, "base", "--label", "first baseline")
     assert r.returncode == 0, r.stderr
     run = env["runs"] / "base"
-    for name in ("metadata.json", "stdout.log", "stderr.log", "perf-stat.txt", "perf.data", "perf-report.txt"):
+    for name in ("metadata.json", "stdout.log", "stderr.log", "perf-stat.txt", "perf.data", "perf-report.txt",
+                 "summary.md", "functions.json"):
         assert (run / name).is_file() and (run / name).stat().st_size > 0, name
+    functions = json.loads((run / "functions.json").read_text())
+    assert len(functions["workers"]) == 4 and functions["functions"][0]["imbalance"] is not None
+    assert "## Functions by self time (s)" in (run / "summary.md").read_text()
+    assert metadata(env, "base")["peak_rss_mb"] > 0  # recorded by the maxrss wrapper around perf stat
 
     stdout = (run / "stdout.log").read_text()
     assert stdout.count("app stdout rank=none threads=3 args=-N 5") == 4  # 3 stat repeats + 1 record
-    assert "===== perf stat: perf stat -r 3 -d -o" in stdout and "===== perf record:" in stdout
+    assert "-m sage.analysis maxrss " in stdout and " -- perf stat -r 3 -d -o" in stdout
+    assert "===== perf record:" in stdout
     assert "app stderr line" in (run / "stderr.log").read_text()
 
     meta = metadata(env, "base")
