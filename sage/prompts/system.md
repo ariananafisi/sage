@@ -81,13 +81,16 @@ Classify every application function with at least 3% of self time. Decide in thi
      is made of, e.g. `--work 256000*100 4000*2000`, and let the tool multiply; check that the
      work ratio it prints matches the change you made. Measure what you can: on few cores a
      kernel may not draw enough bandwidth to be memory-bound even if it would be on a full node.
-   - Read the "per unit B/A" column for each function. Cost per unit falling clearly once the data
-     fits in cache (about 0.8 or less) means the function is memory-bound: `memory_bandwidth_bound`
-     if it streams through arrays, `memory_latency_bound` if its loads are dependent, indirect or
-     scattered. Cost per unit staying the same (about 0.9 to 1.1) means it is not memory-bound:
-     `compute_bound`; or `poor_vectorization` if the annotation shows scalar arithmetic in a loop
-     that could use SIMD; or `branch_misprediction` only with branch counters to back it. Values
-     in between are partly memory-sensitive: say so, and lower your confidence. A function can appear
+   - Read the "per unit B/A" column for each function. Caches are several times faster than main
+     memory, so a function limited by memory gets much cheaper per unit once its data fits: about
+     0.6 or less means memory-bound: `memory_bandwidth_bound` if it streams through arrays,
+     `memory_latency_bound` if its loads are dependent, indirect or scattered. Cost per unit staying
+     about the same (about 0.9 to 1.1) means it is not memory-bound: `compute_bound`; or
+     `poor_vectorization` if the annotation shows scalar arithmetic in a loop that could use SIMD;
+     or `branch_misprediction` only with branch counters to back it. Between about 0.6 and 0.9, the
+     function is partly memory-sensitive (most code gets somewhat cheaper in cache) but memory is
+     not what limits it: classify it as not memory-bound, with medium confidence at most, and give
+     the ratio in the finding. A function can appear
      as several symbols (e.g. `foo [clone ._omp_fn.0]` and `._omp_fn.1` for its parallel loops):
      classify each loop, and report the function by the one with most time.
 3. **Corroborate with the annotation.** In memory-bound code the hot instructions are loads, or the

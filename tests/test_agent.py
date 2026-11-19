@@ -72,7 +72,7 @@ def test_system_prompt_rules_tools_and_limits():
     assert "Separate measured facts from inferences" in text and "`supporting_evidence` holds only measured facts" in flat
     # the diagnosis method: general measurements and decision rules, nothing application-specific
     for rule in ("# Diagnosis method", "about 1.1 or more is uneven", "the least runtime time", "working-set experiment",
-                 "per unit B/A", "about 0.8 or less", "about 0.9 to 1.1", "samples skid",
+                 "per unit B/A", "0.6 or less means memory-bound", "about 0.9 to 1.1", "Between about 0.6 and 0.9", "samples skid",
                  "one per application function with at least 3% of self time", "Read baseline/summary.md first"):
         assert rule in flat, rule
     assert "at most 2 experiment(s)" in text and "33 model calls and 30 minutes" in flat

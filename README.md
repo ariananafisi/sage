@@ -344,14 +344,18 @@ The system prompt tells the agent:
      for the function with the uneven work, not the runtime's spin loop.
   2. **Memory-bound or not:** from a working-set experiment. Rerun with a problem that fits well
      inside the last-level cache (a tenth of its reported size, since it is often shared), then compare cost per unit of work with
-     `compare --work`. A per-unit ratio of about 0.8 or less means memory-bound; about 0.9–1.1 means
+     `compare --work`. A per-unit ratio of about 0.6 or less means memory-bound; 0.6–0.9 means partly memory-sensitive, which is classified as not memory-bound; about 0.9–1.1 means
      not memory-bound (compute-bound, or poor vectorization if the annotation shows scalar loops).
   3. **Corroboration:** where the hot instructions sit in the annotation (loads versus arithmetic,
      allowing for sample skid), and hardware counters if the machine has them.
 
-  These rules were validated without an agent, on the injected cases. A memory-bound injection's
-  cost per unit drops to 0.46 (LULESH) or 0.74 (CoMD) once its data fits in cache, while
-  unmodified compute-bound code stays at 0.9–1.1.
+  The thresholds come from the injected cases on the 4-vCPU development VM, so treat them as
+  calibrated on one machine. Once their data fits in cache, a memory-bound injection's cost per
+  unit falls to 0.20–0.46 (LULESH) or 0.25–0.49 (CoMD). Unmodified code falls only to 0.63–1.06
+  (LULESH, depending on how small the experiment is) or stays at 1.07–1.13 (CoMD). An imbalance
+  injection gives a factor of 2.9 (LULESH, threads) or 1.19 (CoMD, ranks); unmodified code gives
+  1.01–1.04. The reported LLC (260 MiB) overstates the usable cache: CoMD's injected table behaves
+  as cache-resident at 32 MiB but not at 64 MiB.
 
 ### Retry and failure
 
@@ -528,7 +532,7 @@ Measured on the development VM (4 vCPUs, software events only), against the unmo
 | LULESH load imbalance (`-s 90 -i 100 -b 0 -c 0`) | wall 26.6 → 37.4 s; `CalcFBHourglassForceForElems` 9% → 19% of samples; per-thread imbalance factor 2.9 (unmodified 1.0) |
 | LULESH memory-bound (`-s 120 -i 40 -b 0 -c 0`) | wall 22.7 → 42.2 s; `CalcKinematicsForElems` 5% → 48% of samples; cost per element 0.46× when the table fits in cache (unmodified 0.94×) |
 | CoMD load imbalance | rank 0 spends 11.7 s in `force` vs 9.3 s for the fastest rank; the other ranks wait up to 2.4 s in the halo exchange (rank 0: 0.2 s) |
-| CoMD memory-bound (30³ cells) | wall 15.3 → 84.0 s; `ljForce` 98% of samples; cost per atom-step 0.74× when the table fits in cache (unmodified 1.06×) |
+| CoMD memory-bound (30³ cells) | wall 15.3 → 84.0 s; `ljForce` 98% of samples; cost per atom-step 0.25–0.49× when the table fits in cache at 10³ cells (0.85× at 12³; unmodified 1.07–1.13×) |
 
 The suites originally had a "disabled vectorization" case instead of `memory-bound`. It was replaced
 because it could not be detected. GCC barely vectorizes either app's hot loops at `-O3`, whether
