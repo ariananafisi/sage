@@ -1,7 +1,7 @@
 """Per-function analysis of an artifact set, and comparison of two, for diagnosing bottlenecks.
 
     python -m sage.analysis summary RUN_DIR      write RUN_DIR/functions.json and RUN_DIR/summary.md
-    python -m sage.analysis compare A B [--work WA WB]
+    python -m sage.analysis compare A B [--work WA WB]   (WA, WB: numbers or products, e.g. 4000*2000)
                                                  per-function change from artifact set A to B
     python -m sage.analysis maxrss OUT -- CMD... run CMD, write the peak RSS (KiB) of its largest process
 
@@ -192,8 +192,11 @@ def load_set(run_dir: Path) -> tuple[dict, dict]:
 
 
 def render_compare(a_dir: Path, a: tuple[dict, dict], b_dir: Path, b: tuple[dict, dict],
-                   work: tuple[float, float] | None = None) -> str:
+                   work: tuple[str, str] | None = None) -> str:
+    """work: the units of work A and B did, each a number or a product (see work_units)."""
     (ma, ta), (mb, tb) = a, b
+    exprs = work
+    work = (work_units(work[0]), work_units(work[1])) if work else None
     unit = ta["unit"]
     ratio = lambda x, y: f"{y / x:.2f}" if x and y is not None else "-"
     lines = [f"# {a_dir.name} → {b_dir.name}", "",
@@ -209,7 +212,8 @@ def render_compare(a_dir: Path, a: tuple[dict, dict], b_dir: Path, b: tuple[dict
                  f"{ta['worker_kind']}(s)")
     lines.append(f"- Runtime libraries: {ta['runtime_share_pct']}% → {tb['runtime_share_pct']}% of samples")
     if work:
-        lines.append(f"- Work units: A = {work[0]:g}, B = {work[1]:g} (B/A = {work[1] / work[0]:.3g}); "
+        lines.append(f"- Work units: A = {_work_label(exprs[0], work[0])}, B = {_work_label(exprs[1], work[1])} "
+                     f"(B/A = {work[1] / work[0]:.3g}); "
                      "'per unit B/A' below divides each side by its work")
     lines += ["", "| Function | Share A | Share B | A | B | B/A" + (" | per unit B/A" if work else "")
               + " | Imbalance A | Imbalance B |",
@@ -226,6 +230,25 @@ def render_compare(a_dir: Path, a: tuple[dict, dict], b_dir: Path, b: tuple[dict
                      + f" | {(x or {}).get('imbalance') or '-'} | {(y or {}).get('imbalance') or '-'} |")
     lines.append("")
     return "\n".join(lines)
+
+
+_FACTOR = r"\d+(?:\.\d+)?(?:[eE][+-]?\d+)?(?:\^\d+)?"
+WORK_EXPR = re.compile(rf"\s*{_FACTOR}(?:\s*\*\s*{_FACTOR})*\s*")
+
+
+def work_units(expr: str) -> float:
+    """Evaluate a work amount: a number or a product of numbers, each optionally ^ a power (4*40^3*100)."""
+    if not WORK_EXPR.fullmatch(expr):
+        raise ValueError(f"not a number or product of numbers: {expr!r}")
+    value = 1.0
+    for factor in expr.split("*"):
+        base, _, power = factor.strip().partition("^")
+        value *= float(base) ** (int(power) if power else 1)
+    return value
+
+
+def _work_label(expr: str, value: float) -> str:
+    return f"{expr.replace(' ', '')} = {value:g}" if re.search(r"[*^]", expr) else f"{value:g}"
 
 
 def maxrss(out: Path, cmd: list[str]) -> int:
@@ -249,16 +272,21 @@ def main(argv: list[str] | None = None) -> int:
     c = sub.add_parser("compare", help="per-function comparison of two artifact sets")
     c.add_argument("a", type=Path)
     c.add_argument("b", type=Path)
-    c.add_argument("--work", nargs=2, type=float, metavar=("WA", "WB"),
-                   help="units of work done by A and B (e.g. elements x iterations), to compare cost per unit")
+    c.add_argument("--work", nargs=2, metavar=("WA", "WB"),
+                   help="units of work done by A and B, to compare cost per unit: numbers or products of the "
+                        "numbers they are made of (e.g. 256000*100 4000*2000 for atoms*steps)")
     args = parser.parse_args(argv)
     try:
         if args.cmd == "summary":
             summarize(args.run_dir)
             print(f"wrote {args.run_dir / 'summary.md'} and functions.json")
         else:
-            if args.work and min(args.work) <= 0:
-                parser.error("--work values must be positive")
+            if args.work:
+                try:
+                    if min(work_units(w) for w in args.work) <= 0:
+                        parser.error("--work values must be positive")
+                except ValueError as e:
+                    parser.error(f"--work: {e}")
             print(render_compare(args.a, load_set(args.a), args.b, load_set(args.b),
                                  tuple(args.work) if args.work else None))
     except (OSError, RuntimeError, json.JSONDecodeError, KeyError) as e:

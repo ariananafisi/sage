@@ -76,8 +76,10 @@ Classify every application function with at least 3% of self time. Decide in thi
      more iterations or steps so it still runs for a few seconds. Change nothing else. If the
      per-unit result is in between, the small problem may still not fit: say so in limitations.
    - Compare: `compare baseline experiments/<name> --work <units in baseline> <units in experiment>`,
-     where units are the amount of work (for example cells × iterations, or atoms × steps; work
-     them out from `--help`, the source and stdout.log). Measure what you can: on few cores a
+     where units are the amount of work (for example cells × iterations, or atoms × steps; find
+     them in `--help`, the source and stdout.log). Pass each side as the product of the numbers it
+     is made of, e.g. `--work 256000*100 4000*2000`, and let the tool multiply; check that the
+     work ratio it prints matches the change you made. Measure what you can: on few cores a
      kernel may not draw enough bandwidth to be memory-bound even if it would be on a full node.
    - Read the "per unit B/A" column for each function. Cost per unit falling clearly once the data
      fits in cache (about 0.8 or less) means the function is memory-bound: `memory_bandwidth_bound`

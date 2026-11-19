@@ -202,12 +202,14 @@ python -m sage.analysis summary runs/baseline
 ```
 
 ```bash
-python -m sage.analysis compare runs/large runs/small --work 69120000 17280000
+python -m sage.analysis compare runs/large runs/small --work 120^3*40 30^3*640
 ```
 
 - `summary` (re)writes `summary.md` and `functions.json`.
 - `compare` shows, per function, the time in A and B, the ratio, and with `--work` the ratio of
-  cost per unit of work (for example cells × iterations), plus each side's imbalance. For example,
+  cost per unit of work (for example cells × iterations), plus each side's imbalance. Each `--work`
+  value is a number or a product of numbers (`*`, with optional `^` powers); the tool multiplies,
+  and prints the product next to its result. For example,
   it shows whether a function gets cheaper per element when the data fits in cache.
 
 Options:

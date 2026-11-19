@@ -113,7 +113,7 @@ def test_render_summary():
 def test_render_compare_per_unit():
     a = (META, table("lulesh"))
     b = ({**META, "run_command": "/w/app -s 30", "label": "small", "wall_clock": {"app_mean_s": 1.0}}, table("lulesh-imbalance"))
-    md = render_compare(Path("baseline"), a, Path("experiments/small"), b, work=(100.0, 50.0))
+    md = render_compare(Path("baseline"), a, Path("experiments/small"), b, work=("100", "50"))
     assert md.startswith("# baseline → small")
     assert "- Wall-clock: 26.6 s → 1.0 s (B/A = 0.04)" in md
     assert "- Work units: A = 100, B = 50 (B/A = 0.5)" in md
@@ -123,6 +123,24 @@ def test_render_compare_per_unit():
     assert cells[5] == f"{by / ax:.2f}" and cells[6] == f"{(by / 50) / (ax / 100):.2f}"
     assert cells[8] == str(fn(b[1], FB)["imbalance"])
     assert "per unit B/A" not in render_compare(Path("a"), a, Path("b"), b)
+
+
+@pytest.mark.parametrize("expr,value", [("2.56e7", 2.56e7), ("4000*2000", 8e6), (" 4 * 40^3 * 100 ", 2.56e7),
+                                        ("1.5*2", 3.0)])
+def test_work_units(expr, value):
+    assert analysis.work_units(expr) == pytest.approx(value)
+
+
+@pytest.mark.parametrize("expr", ["", "4000x2000", "2+3", "__import__('os')", "4**3", "-5"])
+def test_work_units_rejects_other_expressions(expr):
+    with pytest.raises(ValueError):
+        analysis.work_units(expr)
+
+
+def test_compare_shows_the_work_products():
+    a = (META, table("lulesh"))
+    md = render_compare(Path("baseline"), a, Path("small"), a, work=("256000*100", "4000*2000"))
+    assert "- Work units: A = 256000*100 = 2.56e+07, B = 4000*2000 = 8e+06 (B/A = 0.312)" in md
 
 
 def test_maxrss_records_largest_child_and_passes_exit_code(tmp_path):
@@ -152,6 +170,9 @@ def test_summary_and_compare_cli(tmp_path, monkeypatch, capsys):
     assert analysis.main(["compare", str(tmp_path / "a"), str(tmp_path / "b"), "--work", "2", "1"]) == 0
     assert "# a → b" in capsys.readouterr().out and (tmp_path / "b" / "functions.json").is_file()
     assert analysis.main(["compare", str(tmp_path / "a"), str(tmp_path / "missing")]) == 1
+    for bad in (["2", "0"], ["2", "2+1"]):
+        with pytest.raises(SystemExit):
+            analysis.main(["compare", str(tmp_path / "a"), str(tmp_path / "b"), "--work", *bad])
 
 
 def test_mpi_run_dir_uses_rank_reports(tmp_path, monkeypatch):
