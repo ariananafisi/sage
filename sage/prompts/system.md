@@ -71,8 +71,10 @@ Classify every application function with at least 3% of self time. Decide in thi
 2. **Memory-bound or not.** Decide with a working-set experiment, which classifies every function
    at once:
    - Rerun with a problem small enough that the peak memory (in summary.md) fits well inside the
-     last-level cache, ideally a quarter of it or less. Give it more iterations or steps so it
-     still runs for a few seconds. Change nothing else.
+     last-level cache, ideally a tenth of it or less: the reported size is often shared with other
+     cores (or, on a virtual machine, with other guests), so less of it is really available. Give it
+     more iterations or steps so it still runs for a few seconds. Change nothing else. If the
+     per-unit result is in between, the small problem may still not fit: say so in limitations.
    - Compare: `compare baseline experiments/<name> --work <units in baseline> <units in experiment>`,
      where units are the amount of work (for example cells × iterations, or atoms × steps; work
      them out from `--help`, the source and stdout.log). Measure what you can: on few cores a

@@ -341,7 +341,7 @@ The system prompt tells the agent:
      spend the least time in the parallel runtime, the others are waiting for them. It is reported
      for the function with the uneven work, not the runtime's spin loop.
   2. **Memory-bound or not:** from a working-set experiment. Rerun with a problem that fits well
-     inside the last-level cache, then compare cost per unit of work with
+     inside the last-level cache (a tenth of its reported size, since it is often shared), then compare cost per unit of work with
      `compare --work`. A per-unit ratio of about 0.8 or less means memory-bound; about 0.9–1.1 means
      not memory-bound (compute-bound, or poor vectorization if the annotation shows scalar loops).
   3. **Corroboration:** where the hot instructions sit in the annotation (loads versus arithmetic,
