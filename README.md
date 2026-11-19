@@ -192,6 +192,23 @@ The target must already be built. `profile_target.sh <target> <run-id>` creates
 | `perf-stat.txt` | `perf stat -r 3 -d`: default and cache events, mean and variance over 3 repeats |
 | `perf.data` | `perf record -g` samples with frame-pointer call graphs |
 | `perf-report.txt` | `perf report --no-children --sort overhead,dso,sym`: self time per DSO and symbol, highest first |
+| `functions.json` | each function's self time split over the threads (or, for MPI, the ranks), with an imbalance factor (max / mean over workers), the share of time in parallel runtime libraries (OpenMP/MPI waiting) and in the kernel, and the peak memory of the largest process |
+| `summary.md` | a readable digest: wall-clock and variance, peak memory next to the last-level cache size, counted events, and the per-function, per-thread (or per-rank) table. The agent starts here |
+
+Two analysis commands work on artifact sets:
+
+```bash
+python -m sage.analysis summary runs/baseline
+```
+
+```bash
+python -m sage.analysis compare runs/large runs/small --work 69120000 17280000
+```
+
+- `summary` (re)writes `summary.md` and `functions.json`.
+- `compare` shows, per function, the time in A and B, the ratio, and with `--work` the ratio of
+  cost per unit of work (for example cells × iterations), plus each side's imbalance. For example,
+  it shows whether a function gets cheaper per element when the data fits in cache.
 
 Options:
 
@@ -317,6 +334,21 @@ The system prompt tells the agent:
 - to keep measured facts and inferences apart. `supporting_evidence` holds only facts, each naming
   its artifact. `likely_cause` and the interpretation in `experiment_result` are inferences and
   must be worded as such.
+- a general diagnosis method, applied to every application function with at least 3% of self time.
+  It contains nothing specific to LULESH or CoMD:
+  1. **Load imbalance:** from the per-thread or per-rank split in `summary.md`. An imbalance factor
+     around 1.3 or more, with waiting time in the parallel runtime, means uneven work. It is
+     reported for the function with the uneven work, not the runtime's spin loop.
+  2. **Memory-bound or not:** from a working-set experiment. Rerun with a problem that fits well
+     inside the last-level cache, then compare cost per unit of work with
+     `compare --work`. A per-unit ratio of about 0.8 or less means memory-bound; about 0.9–1.1 means
+     not memory-bound (compute-bound, or poor vectorization if the annotation shows scalar loops).
+  3. **Corroboration:** where the hot instructions sit in the annotation (loads versus arithmetic,
+     allowing for sample skid), and hardware counters if the machine has them.
+
+  These rules were validated without an agent, on the injected cases. A memory-bound injection's
+  cost per unit drops to 0.46 (LULESH) or 0.74 (CoMD) once its data fits in cache, while
+  unmodified compute-bound code stays at 0.9–1.1.
 
 ### Retry and failure
 
@@ -413,6 +445,8 @@ Options:
 
 - `--out DIR`: the output directory (default `evals/<suite>-<timestamp>/`).
 - `--cases id,id`: run only some cases.
+- `--env NAME=VALUE`: set an environment variable for every case, for example the thread count
+  on a large node (repeatable; overrides the suite's `env`).
 - `--model`, `--max-turns`, `--timeout`, `--max-experiments`: the same limits as `analyze`, applied
   to each case.
 
@@ -436,17 +470,40 @@ memory-bound: `CalcHourglassControlForElems`, `CalcFBHourglassForceForElems`,
 computational intensity, in
 [`suites/references/lulesh-afzal2024.yaml`](suites/references/lulesh-afzal2024.yaml).
 
-Every LULESH case runs with the study's settings, `-s 90 -i 100 -b 0 -c 0`:
+Every LULESH case runs with the study's settings, `-s 120 -i 40 -b 0 -c 0`:
 
 - LULESH's built-in load imbalance is off (`-b 0 -c 0`).
-- The working set is about 650 MB, about 20× the last-level cache. The study required at least 10×.
-- 100 iterations instead of the study's 300, to keep a run near 25 s. The classification is per
-  iteration, so the count doesn't affect it.
+- The working set is about 1.5 GB.
+- 40 iterations instead of the study's 300, to keep a 4-core run near 25 s. The classification is
+  per iteration, so the count doesn't affect it.
 
-The study measured Intel Ice Lake and Sapphire Rapids nodes, using hardware counters, 13–18 cores
-per memory domain, and AVX-512 builds. A smaller machine, such as a 4-core VM, may stress memory
-bandwidth less. The comparison stays useful there, but it is not a measurement on the study's
-hardware.
+**The reference is only scored on hardware like the study's.** The study measured Intel Ice Lake
+and Sapphire Rapids nodes with 13–18 cores per memory domain, using hardware counters and AVX-512
+builds. The classification depends on that concurrency: a few cores cannot draw enough bandwidth to
+hit the memory ceiling.
+
+On the 4-vCPU development VM (260 MiB L3), the main LULESH kernels kept the same cost per element
+when the problem shrank from 1.5 GB to 28 MB. That means they are not memory-bound there, so a
+correct agent would disagree with the study.
+
+The reference file therefore records the study's conditions:
+
+- at least 13 threads or ranks per memory domain
+- a working set at least 10× the last-level cache
+
+Each case checks them against its own baseline: thread or rank count, peak memory, and the L3
+size from `lscpu`. If they are not met, the comparison is still shown in the results, marked "not
+scored on this host" with the reasons, and it does not affect the case's score.
+
+To score against the study, run the suite on a node like the study's, with enough threads and a
+problem at least 10× that node's cache:
+
+```bash
+bottleneck-agent eval --suite suites/lulesh.yaml --env OMP_NUM_THREADS=18
+```
+
+On some nodes `-s 120` is not big enough. The working set grows with s³; set the suite's `run`
+line to match.
 
 The agent never sees the study or its results. Its prompts contain no application-specific
 knowledge, and the reference file is in the hidden suite directory. The study is only used to score
@@ -456,16 +513,19 @@ what the agent concludes from its own measurements.
 | --- | --- | --- |
 | `negative-control` | unmodified; scored against the roofline study | unmodified, MPI with 4 ranks (the same setup as its load-imbalance case) |
 | `load-imbalance` | extra work for the first quarter of elements in `CalcFBHourglassForceForElems`; OpenMP's static schedule gives all of it to thread 0 | rank 0 does extra work at the end of `ljForce` every step; the other ranks wait in the halo exchange (MPI, 4 ranks) |
-| `memory-bound` | each element of `CalcKinematicsForElems` (the one hot spot the study finds not memory-bound) follows dependent, scattered reads through a 256 MB table | atoms in `ljForce` follow one dependent chain of scattered reads through a 256 MB table |
+| `memory-bound` | each element of `CalcKinematicsForElems` (the one hot spot the study finds not memory-bound) follows dependent, scattered reads through a table of 64 entries per element | atoms in `ljForce` follow one dependent chain of scattered reads through a table of 1024 entries per atom |
+
+The memory-bound injections' tables grow with the problem, as a real working set does: 1 GiB at
+the default sizes, and 16–32 MiB at small ones. So the working-set experiment can detect them.
 
 Measured on the development VM (4 vCPUs, software events only), against the unmodified build:
 
 | Case | Effect |
 | --- | --- |
-| LULESH load imbalance (`-s 90 -i 100 -b 0 -c 0`) | wall 26.6 → 37.4 s; `CalcFBHourglassForceForElems` 9% → 19% of samples |
-| LULESH memory-bound (same settings) | wall 26.6 → 41.3 s; `CalcKinematicsForElems` 5% → 44% of samples |
+| LULESH load imbalance (`-s 90 -i 100 -b 0 -c 0`) | wall 26.6 → 37.4 s; `CalcFBHourglassForceForElems` 9% → 19% of samples; per-thread imbalance factor 2.9 (unmodified 1.0) |
+| LULESH memory-bound (`-s 120 -i 40 -b 0 -c 0`) | wall 22.7 → 42.2 s; `CalcKinematicsForElems` 5% → 48% of samples; cost per element 0.46× when the table fits in cache (unmodified 0.94×) |
 | CoMD load imbalance | rank 0 spends 11.7 s in `force` vs 9.3 s for the fastest rank; the other ranks wait up to 2.4 s in the halo exchange (rank 0: 0.2 s) |
-| CoMD memory-bound | wall 16.0 → 24.1 s; the table lookup is the hottest source line of `ljForce` (30% of samples) |
+| CoMD memory-bound (30³ cells) | wall 15.3 → 84.0 s; `ljForce` 98% of samples; cost per atom-step 0.74× when the table fits in cache (unmodified 1.06×) |
 
 The suites originally had a "disabled vectorization" case instead of `memory-bound`. It was replaced
 because it could not be detected. GCC barely vectorizes either app's hot loops at `-O3`, whether
@@ -497,14 +557,16 @@ cases:
 Two optional keys apply to reference-based suites like LULESH's:
 
 ```yaml
-run: "{binary} -s 90 -i 100 -b 0 -c 0"   # replaces the config's run command for every case
+run: "{binary} -s 120 -i 40 -b 0 -c 0"   # replaces the config's run command for every case
+env: {OMP_PROC_BIND: close}              # optional: environment for every case (eval --env overrides)
 cases:
   - id: negative-control
     expect: none
     reference: {file: references/lulesh-afzal2024.yaml, variant: openmp}   # unmodified cases only
 ```
 
-A reference file names its source and URL. Under `variants`, it maps each function to `class:
+A reference file names its source and URL, and optionally the `conditions` under which it applies
+(`min_workers`, `min_working_set_to_llc`). Under `variants`, it maps each function to `class:
 memory_bound` or `class: not_memory_bound`, optionally with the measured `intensity`.
 
 The suite is validated before anything runs, and all problems are reported together: keys,
