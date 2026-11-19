@@ -393,6 +393,14 @@ def test_rate_limit_honours_retry_after(cfg, tmp_path, fake, no_sleep):
     assert go(cfg, tmp_path, [with_header, write_valid, done])[0] == agent.OK and no_sleep == [7]
 
 
+def test_exhausted_budget_stops_without_waiting(cfg, tmp_path, fake, no_sleep, capsys):
+    def broke(d):
+        raise api_error(429, {"statusCode": 429, "message": "UserBudgetExceeded"})
+    status, client = go(cfg, tmp_path, [broke, write_valid, done])
+    assert status == agent.BUDGET_EXHAUSTED and no_sleep == [] and len(client.requests) == 1
+    assert "budget for this account is used up" in capsys.readouterr().err
+
+
 def test_persistent_rate_limit_fails_clearly(cfg, tmp_path, fake, no_sleep, capsys):
     status, client = go(cfg, tmp_path, [rate_limited] * 5)
     assert status == agent.FAILED and no_sleep == list(agent.RATE_LIMIT_WAITS)

@@ -740,8 +740,11 @@ Code: `scripts/preflight.sh` and `scripts/build_target.sh` (machine checks, chec
 | 3 | application source was modified |
 | 4 | `findings.json` is missing or still invalid after one retry; no report was written |
 | 5 | the wall-clock limit (`--timeout`) was reached |
+| 6 | the HokieAI budget for your account is used up (HTTP 429 `UserBudgetExceeded`); SAGE stops at once instead of waiting, since only a renewed budget helps |
 
-For `eval`: 0 when every case ran (whatever its score), 1 if any case errored, 2 for an invalid suite or options.
+For `eval`: 0 when every case ran (whatever its score), 1 if any case errored, 2 for an invalid suite or
+options, 6 if the API budget ran out: the suite stops there, and `results.md` lists the cases not run,
+to rerun with `--cases`.
 
 ## Tests
 

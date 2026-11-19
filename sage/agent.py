@@ -35,7 +35,7 @@ DEFAULT_BASE_URL = "https://apim-n1ai-usc-e1f7a372a.azure-api.net/openai/v1"
 DEFAULT_MODEL = "gpt-5"
 
 # Exit codes (also in the README).
-OK, FAILED, USAGE, SOURCE_MODIFIED, INVALID_FINDINGS, TIMED_OUT = 0, 1, 2, 3, 4, 5
+OK, FAILED, USAGE, SOURCE_MODIFIED, INVALID_FINDINGS, TIMED_OUT, BUDGET_EXHAUSTED = 0, 1, 2, 3, 4, 5, 6
 
 
 class PromptError(Exception):
@@ -231,6 +231,10 @@ class AgentError(Exception):
     """The model API failed in a way retrying does not fix."""
 
 
+class BudgetExhausted(AgentError):
+    """The API account's spending budget is used up: no call will succeed until it is renewed."""
+
+
 RATE_LIMIT_WAITS = (15, 30, 60, 60)  # seconds; HokieAI's token limits renew every 60 s
 sleep = time.sleep  # replaced in tests
 
@@ -245,6 +249,9 @@ def complete(client, limits: Limits, messages: list, tools: Tools, transcript: T
             return client.with_options(timeout=remaining).chat.completions.create(
                 model=limits.model, messages=messages, tools=SCHEMAS)
         except openai.RateLimitError as e:
+            if "UserBudgetExceeded" in str(e.body or e.message):
+                raise BudgetExhausted(f"the HokieAI budget for this account is used up (HTTP 429: "
+                                      f"{e.body or e.message}); waiting does not help until it is renewed") from None
             if wait is None:
                 raise AgentError(f"HokieAI kept refusing with HTTP 429 after {len(RATE_LIMIT_WAITS)} waits: "
                                  f"{e.body or e.message}") from None
@@ -369,7 +376,7 @@ def run(cfg: TargetConfig, config_path: Path, root: Path, run_id: str, *, client
     except AgentError as e:
         print(f"error: {e}", file=sys.stderr)
         transcript.write("error", error=str(e))
-        errors, status = findings_errors(r.run_dir), FAILED
+        errors, status = findings_errors(r.run_dir), BUDGET_EXHAUSTED if isinstance(e, BudgetExhausted) else FAILED
 
     (r.run_dir / "report.md").unlink(missing_ok=True)  # the report is always generated, never the agent's
     if errors:
@@ -469,6 +476,8 @@ def main(argv: list[str] | None = None) -> int:
         results = run_suite(suite, out.resolve(), Path.cwd(), client, limits, base_url, only, env)
         s = results["summary"]
         print(f"\n{s['correct']} of {s['cases']} cases correct; results: {out / 'results.md'}")
+        if results.get("not_run"):
+            return BUDGET_EXHAUSTED
         return OK if s["errors"] == 0 else FAILED
 
     # Validate everything up front, before running anything or calling the API.

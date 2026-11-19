@@ -28,7 +28,8 @@ from .guard import HIDDEN_REASON
 
 BOTTLENECK_TYPES = SCHEMA["definitions"]["finding"]["properties"]["bottleneck_type"]["enum"]
 CASE_ID = re.compile(r"[a-z0-9][a-z0-9-]*")
-STATUS_NAMES = {0: "ok", 1: "failed", 3: "source modified", 4: "invalid findings", 5: "timed out"}
+STATUS_NAMES = {0: "ok", 1: "failed", 3: "source modified", 4: "invalid findings", 5: "timed out",
+                6: "API budget used up"}
 REFERENCE_CLASSES = ("memory_bound", "not_memory_bound")
 # How a finding's bottleneck type maps onto a roofline classification. Types that say nothing about
 # memory versus in-core limits (load imbalance, synchronization, ...) map to None: no classification.
@@ -398,6 +399,9 @@ def render_markdown(results: dict) -> str:
                    f"{fps.replace('|', '/')} | {c.get('experiments', 0)} | {c.get('duration_s') or '-'} | "
                    f"{'**yes**' if c.get('correct') else 'no'} |")
     out.append("")
+    if results.get("not_run"):
+        out += [f"**Not run, because the API budget was used up:** {', '.join(results['not_run'])}. "
+                "Rerun them with `--cases` once it is renewed.", ""]
     for c in results["cases"]:
         out += [f"## {c['id']}", "", c.get("description") or "", ""]
         if c.get("error"):
@@ -544,6 +548,11 @@ def run_suite(suite: Suite, out: Path, root: Path, client, limits: agent.Limits,
         results["cases"].append(record)
         results["summary"] = summarize(results["cases"])
         write_results(results, out)  # after every case, so partial results survive an interruption
+        if record.get("exit_code") == agent.BUDGET_EXHAUSTED:  # every later case would fail the same way
+            results["not_run"] = [c.id for c in cases[n:]]
+            if results["not_run"]:
+                print(f"eval: the API budget is used up; not running {', '.join(results['not_run'])}", file=sys.stderr)
+            break
     results["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     write_results(results, out)
     return results

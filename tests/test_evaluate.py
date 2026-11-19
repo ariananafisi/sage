@@ -373,6 +373,18 @@ def test_agent_crash_is_recorded_and_the_suite_continues(tmp_path, harness, monk
     assert results["cases"][1]["correct"]
 
 
+def test_exhausted_budget_stops_the_suite(tmp_path, harness, monkeypatch):
+    def broke(cfg, config_path, root, run_id, **kw):
+        harness.append(run_id)
+        return agent.BUDGET_EXHAUSTED
+    monkeypatch.setattr(agent, "run", broke)
+    out = tmp_path / "out"
+    results = evaluate.run_suite(load_suite(FIXTURES / "suite.yaml"), out, tmp_path, None, agent.Limits(), "u")
+    assert harness == ["case-1"] and [c["status"] for c in results["cases"]] == ["API budget used up"]
+    assert results["not_run"] == ["load-imbalance", "broken"]
+    assert "Not run, because the API budget was used up:** load-imbalance, broken" in (out / "results.md").read_text()
+
+
 def test_only_selected_cases(tmp_path, harness):
     results = evaluate.run_suite(load_suite(FIXTURES / "suite.yaml"), tmp_path / "out", tmp_path, None,
                                  agent.Limits(), "u", only=["load-imbalance"])
